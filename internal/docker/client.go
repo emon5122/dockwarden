@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/registry"
 	dockerclient "github.com/docker/docker/client"
 	log "github.com/sirupsen/logrus"
@@ -177,6 +178,37 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 
 	log.Debugf("Recreating container %s with latest image", containerName)
 
+	// Build NetworkingConfig from current network settings
+	// This preserves networks, aliases, IP addresses, etc.
+	networkingConfig := &network.NetworkingConfig{
+		EndpointsConfig: make(map[string]*network.EndpointSettings),
+	}
+	if inspect.NetworkSettings != nil && inspect.NetworkSettings.Networks != nil {
+		for netName, netSettings := range inspect.NetworkSettings.Networks {
+			if netSettings != nil {
+				// Copy the endpoint settings, but clear dynamic fields that will be reassigned
+				endpointConfig := &network.EndpointSettings{
+					// Preserve user-defined settings
+					Aliases:             netSettings.Aliases,
+					Links:               netSettings.Links,
+					MacAddress:          netSettings.MacAddress,
+					DriverOpts:          netSettings.DriverOpts,
+					IPAMConfig:          netSettings.IPAMConfig,
+					NetworkID:           netSettings.NetworkID,
+					EndpointID:          "", // Will be assigned on connect
+					Gateway:             "", // Will be assigned on connect
+					IPAddress:           "", // Will be assigned on connect (unless static in IPAMConfig)
+					IPPrefixLen:         0,  // Will be assigned on connect
+					IPv6Gateway:         "", // Will be assigned on connect
+					GlobalIPv6Address:   "", // Will be assigned on connect
+					GlobalIPv6PrefixLen: 0,
+				}
+				networkingConfig.EndpointsConfig[netName] = endpointConfig
+				log.Debugf("Preserving network %s for container %s", netName, containerName)
+			}
+		}
+	}
+
 	// Stop container if running
 	if inspect.State.Running {
 		timeoutSec := int(timeout.Seconds())
@@ -196,14 +228,30 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 	}
 	log.Debugf("Removed old container %s", containerName)
 
-	// Create new container with same config but updated image reference
-	// The image should already be pulled with latest tag
-	createResp, err := c.api.ContainerCreate(ctx, inspect.Config, inspect.HostConfig, nil, nil, containerName)
+	// Create new container with same config, host config, AND network config
+	createResp, err := c.api.ContainerCreate(ctx, inspect.Config, inspect.HostConfig, networkingConfig, nil, containerName)
 	if err != nil {
 		return "", fmt.Errorf("failed to create container %s: %w", containerName, err)
 	}
 	newID := createResp.ID
 	log.Debugf("Created new container %s with ID %s", containerName, newID[:12])
+
+	// Connect to additional networks (ContainerCreate only connects to one network)
+	// We need to explicitly connect to other networks
+	networkCount := 0
+	for netName, endpointConfig := range networkingConfig.EndpointsConfig {
+		networkCount++
+		if networkCount == 1 {
+			// First network is handled by ContainerCreate
+			continue
+		}
+		// Connect to additional networks
+		if err := c.api.NetworkConnect(ctx, endpointConfig.NetworkID, newID, endpointConfig); err != nil {
+			log.Warnf("Failed to connect container %s to network %s: %v", containerName, netName, err)
+		} else {
+			log.Debugf("Connected container %s to network %s", containerName, netName)
+		}
+	}
 
 	// Start the new container
 	if err := c.api.ContainerStart(ctx, newID, container.StartOptions{}); err != nil {
