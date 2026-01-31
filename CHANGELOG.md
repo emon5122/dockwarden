@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.2](https://github.com/emon5122/dockwarden/compare/v1.0.1...v1.0.2) (2026-01-31)
+
+
+### Bug Fixes
+
+* Implement self-update protection for dockwarden container and enhance Docker auth handling ([537770d](https://github.com/emon5122/dockwarden/commit/537770deaea6197ba73cc9d2e79b1f0a67275c8b))
+* Update GoReleaser action to v6 and specify version constraint ([68603dd](https://github.com/emon5122/dockwarden/commit/68603dd635b50b991b60726fb4d3885c878e5673))
+
 ## [1.0.1](https://github.com/emon5122/dockwarden/compare/v1.0.0...v1.0.1) (2026-01-31)
 
 
