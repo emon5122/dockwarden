@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.5](https://github.com/emon5122/dockwarden/compare/v1.0.4...v1.0.5) (2026-01-31)
+
+
+### Bug Fixes
+
+* solved some high CVEs through deps ([3c19557](https://github.com/emon5122/dockwarden/commit/3c19557635a166e2ef43f857540e2cf63cdee089))
+
 ## [1.0.4](https://github.com/emon5122/dockwarden/compare/v1.0.3...v1.0.4) (2026-01-31)
 
 
