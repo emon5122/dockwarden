@@ -100,8 +100,8 @@ func (u *Updater) processContainersConcurrently(ctx context.Context, containers 
 	resultsChan := make(chan UpdateResult, len(containers))
 	var wg sync.WaitGroup
 
-	// Determine concurrency limit (don't overwhelm Docker daemon)
-	maxConcurrency := 5
+	// Determine concurrency limit - higher for faster checks
+	maxConcurrency := 10
 	if u.config.RollingRestart {
 		maxConcurrency = 1 // Sequential for rolling restart
 	}

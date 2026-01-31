@@ -249,7 +249,8 @@ func (c *dockerClient) PullImage(ctx context.Context, imageName string) error {
 		log.Debugf("Pull %s: %s %s", imageName, message.Status, message.Progress)
 	}
 
-	log.Infof("Pulled image %s", imageName)
+	// Only log at debug level - the caller will log if there's an actual update
+	log.Debugf("Pulled image %s", imageName)
 	return nil
 }
 
