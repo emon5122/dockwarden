@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2024 emon5122
+Copyright (c) 2026 Istiak Hassan Emon
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,17 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This project incorporates code from the following projects:
-
-## Watchtower
-Copyright (c) 2015-2023 containrrr
-Licensed under the Apache License, Version 2.0
-https://github.com/containrrr/watchtower
-
-## Docker Watchdog
-Copyright (c) 2020 André Germann
-Licensed under the MIT License
-https://github.com/buanet/docker.watchdog
