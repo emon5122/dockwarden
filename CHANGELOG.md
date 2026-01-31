@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3](https://github.com/emon5122/dockwarden/compare/v1.0.2...v1.0.3) (2026-01-31)
+
+
+### Bug Fixes
+
+* update GoReleaser configuration and improve logging levels ([299a9a0](https://github.com/emon5122/dockwarden/commit/299a9a038cd4124df6664e3563df5142a4151473))
+
 ## [1.0.2](https://github.com/emon5122/dockwarden/compare/v1.0.1...v1.0.2) (2026-01-31)
 
 
