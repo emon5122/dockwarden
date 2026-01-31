@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.4](https://github.com/emon5122/dockwarden/compare/v1.0.3...v1.0.4) (2026-01-31)
+
+
+### Bug Fixes
+
+* enhance RecreateContainer to preserve and reconnect network settings ([26c3bd4](https://github.com/emon5122/dockwarden/commit/26c3bd4b5666891a9908e490ff2755ff1050a841))
+
 ## [1.0.3](https://github.com/emon5122/dockwarden/compare/v1.0.2...v1.0.3) (2026-01-31)
 
 
