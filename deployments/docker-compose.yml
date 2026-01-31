@@ -1,0 +1,30 @@
+# ============================================================================
+# DockWarden - Basic Docker Compose
+# Simple setup with direct socket access
+# ============================================================================
+
+services:
+  dockwarden:
+    image: emon5122/dockwarden:latest
+    container_name: dockwarden
+    restart: unless-stopped
+    volumes:
+      # Docker socket for container management
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Update behavior
+      - DOCKWARDEN_INTERVAL=300 # Check every 5 minutes
+      - DOCKWARDEN_CLEANUP=true # Remove old images
+      - DOCKWARDEN_LABEL_ENABLE=false # Monitor all containers
+
+      # Health monitoring
+      - DOCKWARDEN_HEALTH_WATCH=true # Enable health monitoring
+      - DOCKWARDEN_HEALTH_ACTION=restart # Auto-restart unhealthy containers
+
+      # Logging
+      - DOCKWARDEN_LOG_LEVEL=info
+      - TZ=UTC
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    read_only: true

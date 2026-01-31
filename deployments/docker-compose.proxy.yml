@@ -1,0 +1,115 @@
+# ============================================================================
+# DockWarden - Docker Compose with Socket Proxy
+# Maximum security setup using socket proxy for least-privilege access
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # DockWarden - Container Manager
+  # ==========================================================================
+  dockwarden:
+    image: emon5122/dockwarden:latest
+    container_name: dockwarden
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    # NO direct socket access - uses proxy instead
+    environment:
+      # Connect to socket proxy instead of direct socket
+      - DOCKER_HOST=tcp://socket-proxy:2375
+
+      # Update behavior
+      - DOCKWARDEN_INTERVAL=300
+      - DOCKWARDEN_CLEANUP=true
+      - DOCKWARDEN_LABEL_ENABLE=false
+
+      # Health monitoring
+      - DOCKWARDEN_HEALTH_WATCH=true
+      - DOCKWARDEN_HEALTH_ACTION=restart
+
+      # Logging
+      - DOCKWARDEN_LOG_LEVEL=info
+      - TZ=UTC
+    secrets:
+      - registry_auth
+    networks:
+      - dockwarden-internal
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  # ==========================================================================
+  # Docker Socket Proxy - Security Layer
+  # Only exposes necessary Docker API endpoints
+  # ==========================================================================
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: dockwarden-socket-proxy
+    restart: unless-stopped
+    privileged: true
+    environment:
+      # Disable all by default
+      - LOG_LEVEL=warning
+
+      # Read operations (GET)
+      - CONTAINERS=1 # List/inspect containers
+      - IMAGES=1 # List/inspect images
+      - NETWORKS=0 # Network operations (disabled)
+      - VOLUMES=0 # Volume operations (disabled)
+      - SERVICES=0 # Swarm services (disabled)
+      - TASKS=0 # Swarm tasks (disabled)
+      - NODES=0 # Swarm nodes (disabled)
+      - INFO=1 # Docker info
+      - VERSION=1 # Docker version
+      - EVENTS=1 # Docker events
+      - PING=1 # Docker ping
+
+      # Write operations (POST/PUT/DELETE)
+      - POST=1 # Required for restart, pull
+      - BUILD=0 # Image build (disabled)
+      - COMMIT=0 # Container commit (disabled)
+      - CONFIGS=0 # Swarm configs (disabled)
+      - DISTRIBUTION=1 # Registry distribution (for image checks)
+      - EXEC=0 # Container exec (disabled - more secure)
+      - PLUGINS=0 # Plugin management (disabled)
+      - SECRETS=0 # Swarm secrets API (disabled)
+      - SYSTEM=0 # System operations (disabled)
+      - AUTH=1 # Registry auth
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - dockwarden-internal
+    # Restrict to internal network only
+    expose:
+      - "2375"
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  dockwarden-internal:
+    driver: bridge
+    internal: true # No external access
+
+# ============================================================================
+# Secrets
+# ============================================================================
+secrets:
+  registry_auth:
+    file: ./secrets/registry-auth.json

@@ -1,0 +1,36 @@
+# Binaries
+*.exe
+
+# Build artifacts
+dist/
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Docker
+*.tar
+
+# Secrets (never commit these!)
+secrets/
+*.secret
+*.key
+*.pem
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/

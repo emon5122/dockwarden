@@ -1,0 +1,142 @@
+# ============================================================================
+# DockWarden - Full Stack with Monitoring
+# Complete setup with Prometheus, Grafana, and notifications
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # DockWarden - Container Manager
+  # ==========================================================================
+  dockwarden:
+    image: emon5122/dockwarden:latest
+    container_name: dockwarden
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    environment:
+      - DOCKER_HOST=tcp://socket-proxy:2375
+
+      # Schedule updates at 4 AM daily
+      - DOCKWARDEN_SCHEDULE=0 0 4 * * *
+      - DOCKWARDEN_CLEANUP=true
+      - DOCKWARDEN_LABEL_ENABLE=false
+
+      # Health monitoring
+      - DOCKWARDEN_HEALTH_WATCH=true
+      - DOCKWARDEN_HEALTH_ACTION=restart
+
+      # API & Metrics
+      - DOCKWARDEN_API_ENABLED=true
+      - DOCKWARDEN_API_PORT=8080
+      - DOCKWARDEN_METRICS=true
+
+      # Logging
+      - DOCKWARDEN_LOG_LEVEL=info
+      - DOCKWARDEN_LOG_FORMAT=json
+      - TZ=UTC
+    secrets:
+      - registry_auth
+      - dockwarden_api_token
+    networks:
+      - dockwarden-internal
+      - monitoring
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    labels:
+      # Don't let DockWarden update itself automatically
+      - "dockwarden.update.enable=false"
+
+  # ==========================================================================
+  # Docker Socket Proxy
+  # ==========================================================================
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: dockwarden-socket-proxy
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - CONTAINERS=1
+      - IMAGES=1
+      - INFO=1
+      - VERSION=1
+      - EVENTS=1
+      - PING=1
+      - POST=1
+      - DISTRIBUTION=1
+      - AUTH=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - dockwarden-internal
+    expose:
+      - "2375"
+
+  # ==========================================================================
+  # Prometheus - Metrics Collection
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+    networks:
+      - monitoring
+    ports:
+      - "9090:9090"
+
+  # ==========================================================================
+  # Grafana - Dashboards
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD__FILE=/run/secrets/grafana_password
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+    secrets:
+      - grafana_password
+    networks:
+      - monitoring
+    ports:
+      - "3000:3000"
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  dockwarden-internal:
+    driver: bridge
+    internal: true
+  monitoring:
+    driver: bridge
+
+# ============================================================================
+# Volumes
+# ============================================================================
+volumes:
+  prometheus-data:
+  grafana-data:
+
+# ============================================================================
+# Secrets
+# ============================================================================
+secrets:
+  registry_auth:
+    file: ./secrets/registry-auth.json
+  dockwarden_api_token:
+    file: ./secrets/api-token.txt
+  grafana_password:
+    file: ./secrets/grafana-password.txt
