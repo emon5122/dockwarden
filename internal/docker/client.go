@@ -285,43 +285,115 @@ func (c *dockerClient) RemoveImage(ctx context.Context, imageID string) error {
 
 // getRegistryAuth returns the base64 encoded auth for a registry
 func getRegistryAuth(imageName string) string {
-	// Check for registry secret path
-	secretPath := os.Getenv("DOCKWARDEN_REGISTRY_SECRET")
-	if secretPath == "" {
-		return ""
+	// Determine the registry from image name
+	registry := getRegistryFromImage(imageName)
+
+	// Try to find auth config from multiple sources
+	configPaths := getDockerConfigPaths()
+
+	for _, configPath := range configPaths {
+		if auth := getAuthFromConfig(configPath, registry); auth != "" {
+			log.Debugf("Found auth for registry %s from %s", registry, configPath)
+			return auth
+		}
 	}
 
-	// Read and parse the secret file
-	data, err := os.ReadFile(secretPath)
+	log.Debugf("No auth found for registry %s", registry)
+	return ""
+}
+
+// getDockerConfigPaths returns possible Docker config file paths in priority order
+func getDockerConfigPaths() []string {
+	var paths []string
+
+	// 1. Environment variable takes highest priority
+	if secretPath := os.Getenv("DOCKWARDEN_REGISTRY_SECRET"); secretPath != "" {
+		paths = append(paths, secretPath)
+	}
+
+	// 2. DOCKER_CONFIG environment variable
+	if dockerConfig := os.Getenv("DOCKER_CONFIG"); dockerConfig != "" {
+		paths = append(paths, dockerConfig+"/config.json")
+	}
+
+	// 3. User's home directory
+	if home := os.Getenv("HOME"); home != "" {
+		paths = append(paths, home+"/.docker/config.json")
+	}
+
+	// 4. Root's docker config (for running as root in container)
+	paths = append(paths, "/root/.docker/config.json")
+
+	return paths
+}
+
+// getRegistryFromImage extracts the registry hostname from an image reference
+func getRegistryFromImage(imageName string) string {
+	// Remove tag or digest
+	if idx := strings.Index(imageName, "@"); idx != -1 {
+		imageName = imageName[:idx]
+	}
+	if idx := strings.LastIndex(imageName, ":"); idx != -1 {
+		// Make sure it's not a port number followed by a path
+		afterColon := imageName[idx+1:]
+		if !strings.Contains(afterColon, "/") {
+			imageName = imageName[:idx]
+		}
+	}
+
+	// Check if image has a registry prefix
+	if strings.Contains(imageName, "/") {
+		parts := strings.SplitN(imageName, "/", 2)
+		// If first part contains a dot or colon, it's a registry
+		if strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") {
+			return parts[0]
+		}
+	}
+
+	// Default to Docker Hub
+	return "docker.io"
+}
+
+// getAuthFromConfig reads auth from a Docker config file
+func getAuthFromConfig(configPath string, registry string) string {
+	data, err := os.ReadFile(configPath)
 	if err != nil {
-		log.Debugf("Failed to read registry secret: %v", err)
 		return ""
 	}
 
-	var config struct {
+	var dockerConfig struct {
 		Auths map[string]struct {
 			Auth string `json:"auth"`
 		} `json:"auths"`
 	}
 
-	if err := json.Unmarshal(data, &config); err != nil {
-		log.Debugf("Failed to parse registry secret: %v", err)
+	if err := json.Unmarshal(data, &dockerConfig); err != nil {
+		log.Debugf("Failed to parse docker config %s: %v", configPath, err)
 		return ""
 	}
 
-	// Determine the registry
-	registry := "https://index.docker.io/v1/"
-	if strings.Contains(imageName, "/") {
-		parts := strings.SplitN(imageName, "/", 2)
-		if strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") {
-			registry = parts[0]
-		}
+	// Try exact match first
+	if auth, ok := dockerConfig.Auths[registry]; ok && auth.Auth != "" {
+		return auth.Auth
 	}
 
-	// Find matching auth
-	for r, auth := range config.Auths {
-		if strings.Contains(r, registry) || strings.Contains(registry, r) {
-			return auth.Auth
+	// Try with https:// prefix
+	if auth, ok := dockerConfig.Auths["https://"+registry]; ok && auth.Auth != "" {
+		return auth.Auth
+	}
+
+	// For Docker Hub, try multiple known keys
+	if registry == "docker.io" {
+		dockerHubKeys := []string{
+			"https://index.docker.io/v1/",
+			"index.docker.io",
+			"https://index.docker.io",
+			"registry-1.docker.io",
+		}
+		for _, key := range dockerHubKeys {
+			if auth, ok := dockerConfig.Auths[key]; ok && auth.Auth != "" {
+				return auth.Auth
+			}
 		}
 	}
 

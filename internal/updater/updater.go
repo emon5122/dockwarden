@@ -3,6 +3,7 @@ package updater
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -227,6 +228,12 @@ func (u *Updater) checkForUpdate(ctx context.Context, ctr docker.Container) (boo
 		return false, nil
 	}
 
+	// Skip pulling if image has a pinned tag (specific version that won't change)
+	if isPinnedTag(ctr.Image) {
+		log.Debugf("Skipping pull for %s: image has pinned tag", ctr.Name)
+		return false, nil
+	}
+
 	// Get current image digest
 	currentDigest, err := u.client.GetImageDigest(ctx, ctr.Image)
 	if err != nil {
@@ -304,4 +311,81 @@ func truncateID(id string) string {
 		return id[:12]
 	}
 	return id
+}
+
+// isPinnedTag checks if an image reference uses a pinned tag that won't change.
+// Pinned tags include:
+// - Digest references (image@sha256:...)
+// - Semantic versions (v1.2.3, 1.2.3, 14.4-bullseye, etc.)
+// - Release tags (RELEASE.2025-04-22T22-12-26Z, etc.)
+// Floating tags that should be pulled:
+// - latest, edge, main, master, dev, develop, nightly, stable, beta, alpha
+func isPinnedTag(imageName string) bool {
+	// Check if it's a digest reference - always pinned
+	if strings.Contains(imageName, "@sha256:") {
+		return true
+	}
+
+	// Extract the tag from the image name
+	tag := extractTag(imageName)
+	if tag == "" {
+		return false // No tag means :latest implicitly
+	}
+
+	// Floating tags that can change - should be pulled
+	floatingTags := []string{
+		"latest",
+		"edge",
+		"main",
+		"master",
+		"dev",
+		"develop",
+		"development",
+		"nightly",
+		"stable",
+		"beta",
+		"alpha",
+		"canary",
+		"rc",
+		"next",
+		"preview",
+	}
+
+	tagLower := strings.ToLower(tag)
+	for _, floating := range floatingTags {
+		if tagLower == floating {
+			return false
+		}
+	}
+
+	// If the tag contains version-like patterns, it's likely pinned
+	// Patterns: v1.2.3, 1.2.3, 14.4, RELEASE.xxx, sha-xxx, etc.
+	return true
+}
+
+// extractTag extracts the tag from an image name
+// Examples:
+//   - nginx:1.21 -> 1.21
+//   - ghcr.io/org/image:v1.0.0 -> v1.0.0
+//   - nginx -> "" (empty, implies latest)
+//   - nginx:latest -> latest
+func extractTag(imageName string) string {
+	// Handle digest references
+	if idx := strings.Index(imageName, "@"); idx != -1 {
+		imageName = imageName[:idx]
+	}
+
+	// Find the last colon that's not part of a port
+	lastColon := strings.LastIndex(imageName, ":")
+	if lastColon == -1 {
+		return "" // No tag
+	}
+
+	// Check if this colon is part of a registry port (e.g., localhost:5000/image)
+	afterColon := imageName[lastColon+1:]
+	if strings.Contains(afterColon, "/") {
+		return "" // The colon was part of registry:port, no tag
+	}
+
+	return afterColon
 }
