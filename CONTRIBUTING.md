@@ -40,7 +40,7 @@ This project follows a code of conduct. By participating, you are expected to up
 
 ### Prerequisites
 
-- Go 1.25.5+
+- Go 1.25.6+
 - Docker
 - Make (optional)
 
