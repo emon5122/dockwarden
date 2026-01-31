@@ -190,6 +190,12 @@ func (u *Updater) filterContainers(containers []docker.Container) []docker.Conta
 
 containerLoop:
 	for _, ctr := range containers {
+		// Skip dockwarden's own container to prevent self-update suicide
+		if isSelfContainer(ctr) {
+			log.Debugf("Skipping %s: self-update protection (dockwarden container)", ctr.Name)
+			continue
+		}
+
 		// Skip disabled containers
 		for _, disabled := range u.config.DisableContainers {
 			if ctr.Name == disabled {
@@ -388,4 +394,27 @@ func extractTag(imageName string) string {
 	}
 
 	return afterColon
+}
+
+// isSelfContainer checks if a container is the dockwarden container itself.
+// This prevents dockwarden from updating and killing itself.
+func isSelfContainer(ctr docker.Container) bool {
+	// Check by container name
+	nameLower := strings.ToLower(ctr.Name)
+	if strings.Contains(nameLower, "dockwarden") {
+		return true
+	}
+
+	// Check by image name
+	imageLower := strings.ToLower(ctr.Image)
+	if strings.Contains(imageLower, "dockwarden") {
+		return true
+	}
+
+	// Check by label - allow explicit override
+	if ctr.GetLabel("dockwarden.self") == "true" {
+		return true
+	}
+
+	return false
 }

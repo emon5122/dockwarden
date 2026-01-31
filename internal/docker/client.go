@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/registry"
 	dockerclient "github.com/docker/docker/client"
 	log "github.com/sirupsen/logrus"
 )
@@ -355,7 +357,7 @@ func getRegistryFromImage(imageName string) string {
 }
 
 // getAuthFromConfig reads auth from a Docker config file
-func getAuthFromConfig(configPath string, registry string) string {
+func getAuthFromConfig(configPath string, registryHost string) string {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return ""
@@ -372,18 +374,49 @@ func getAuthFromConfig(configPath string, registry string) string {
 		return ""
 	}
 
+	// Helper function to convert docker config auth to API format
+	convertAuth := func(authBase64, serverAddress string) string {
+		// Docker config stores auth as base64(username:password)
+		// Docker API expects base64(json{"username":"x","password":"y","serveraddress":"z"})
+		decoded, err := base64.StdEncoding.DecodeString(authBase64)
+		if err != nil {
+			log.Debugf("Failed to decode auth: %v", err)
+			return ""
+		}
+
+		parts := strings.SplitN(string(decoded), ":", 2)
+		if len(parts) != 2 {
+			log.Debugf("Invalid auth format")
+			return ""
+		}
+
+		authConfig := registry.AuthConfig{
+			Username:      parts[0],
+			Password:      parts[1],
+			ServerAddress: serverAddress,
+		}
+
+		jsonAuth, err := json.Marshal(authConfig)
+		if err != nil {
+			log.Debugf("Failed to marshal auth config: %v", err)
+			return ""
+		}
+
+		return base64.URLEncoding.EncodeToString(jsonAuth)
+	}
+
 	// Try exact match first
-	if auth, ok := dockerConfig.Auths[registry]; ok && auth.Auth != "" {
-		return auth.Auth
+	if auth, ok := dockerConfig.Auths[registryHost]; ok && auth.Auth != "" {
+		return convertAuth(auth.Auth, registryHost)
 	}
 
 	// Try with https:// prefix
-	if auth, ok := dockerConfig.Auths["https://"+registry]; ok && auth.Auth != "" {
-		return auth.Auth
+	if auth, ok := dockerConfig.Auths["https://"+registryHost]; ok && auth.Auth != "" {
+		return convertAuth(auth.Auth, registryHost)
 	}
 
 	// For Docker Hub, try multiple known keys
-	if registry == "docker.io" {
+	if registryHost == "docker.io" {
 		dockerHubKeys := []string{
 			"https://index.docker.io/v1/",
 			"index.docker.io",
@@ -392,7 +425,7 @@ func getAuthFromConfig(configPath string, registry string) string {
 		}
 		for _, key := range dockerHubKeys {
 			if auth, ok := dockerConfig.Auths[key]; ok && auth.Auth != "" {
-				return auth.Auth
+				return convertAuth(auth.Auth, key)
 			}
 		}
 	}
