@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/emon5122/dockwarden/compare/v1.0.0...v1.0.1) (2026-01-31)
+
+
+### Bug Fixes
+
+* Update Go version to 1.24 in workflow and add .goreleaser.yaml for release management ([550e9dd](https://github.com/emon5122/dockwarden/commit/550e9dd66f389b676c26fc40f98d65e213756f0a))
+
 ## 1.0.0 (2026-01-31)
 
 
