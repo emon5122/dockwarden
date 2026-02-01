@@ -187,11 +187,13 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 		for netName, netSettings := range inspect.NetworkSettings.Networks {
 			if netSettings != nil {
 				// Copy the endpoint settings, but clear dynamic fields that will be reassigned
+				// IMPORTANT: Do NOT preserve MacAddress - Docker uses MAC to track endpoint identity
+				// and preserving it causes stale DNS entries to accumulate. Let Docker assign
+				// a fresh MAC address to ensure clean DNS registration.
 				endpointConfig := &network.EndpointSettings{
 					// Preserve user-defined settings
 					Aliases:             netSettings.Aliases,
 					Links:               netSettings.Links,
-					MacAddress:          netSettings.MacAddress,
 					DriverOpts:          netSettings.DriverOpts,
 					IPAMConfig:          netSettings.IPAMConfig,
 					NetworkID:           netSettings.NetworkID,
@@ -202,6 +204,7 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 					IPv6Gateway:         "", // Will be assigned on connect
 					GlobalIPv6Address:   "", // Will be assigned on connect
 					GlobalIPv6PrefixLen: 0,
+					MacAddress:          "", // Let Docker assign new MAC for clean DNS registration
 				}
 				networkingConfig.EndpointsConfig[netName] = endpointConfig
 				log.Debugf("Preserving network %s for container %s", netName, containerName)
