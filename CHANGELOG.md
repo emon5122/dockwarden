@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.7](https://github.com/emon5122/dockwarden/compare/v1.0.6...v1.0.7) (2026-02-01)
+
+
+### Bug Fixes
+
+* prevent stale DNS entries by allowing Docker to assign new MAC addresses in RecreateContainer ([94d4466](https://github.com/emon5122/dockwarden/commit/94d4466cd0dab98f6bf602196c278bcc0931540c))
+
 ## [1.0.6](https://github.com/emon5122/dockwarden/compare/v1.0.5...v1.0.6) (2026-01-31)
 
 
