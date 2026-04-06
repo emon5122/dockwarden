@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.0](https://github.com/emon5122/dockwarden/compare/v1.0.7...v1.1.0) (2026-04-06)
+
+
+### Features
+
+* Implement session-based authentication and login/logout functionality ([61c5ea0](https://github.com/emon5122/dockwarden/commit/61c5ea0f3f10e7819a8575c80dcb2642ebd76178))
+
+
+### Bug Fixes
+
+* update Go version to 1.25.8 in CI workflow ([d6829c6](https://github.com/emon5122/dockwarden/commit/d6829c6d902675b174335bec6da0aaeb1ca5a669))
+
 ## [1.0.7](https://github.com/emon5122/dockwarden/compare/v1.0.6...v1.0.7) (2026-02-01)
 
 
