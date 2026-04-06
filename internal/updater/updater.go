@@ -3,6 +3,7 @@ package updater
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,17 +60,36 @@ func (u *Updater) Run() error {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	// Filter containers
-	filtered := u.filterContainers(containers)
+	// Separate self container from others using actual container ID
+	var selfContainer *docker.Container
+	var otherContainers []docker.Container
+
+	selfID := u.client.GetSelfContainerID()
+
+	for _, ctr := range containers {
+		if selfID != "" && strings.HasPrefix(ctr.ID, selfID) {
+			c := ctr
+			selfContainer = &c
+		} else if selfID == "" && isSelfContainer(ctr) {
+			// Fallback to name-based detection if we can't determine own ID
+			c := ctr
+			selfContainer = &c
+		} else {
+			otherContainers = append(otherContainers, ctr)
+		}
+	}
+
+	// Filter non-self containers
+	filtered := u.filterContainers(otherContainers)
 	log.Debugf("Found %d containers to check (%d total)", len(filtered), len(containers))
 
-	if len(filtered) == 0 {
+	if len(filtered) == 0 && selfContainer == nil {
 		log.Info("No containers to update")
 		u.recordRun(startTime)
 		return nil
 	}
 
-	// Process containers concurrently using goroutines
+	// Process non-self containers concurrently
 	results := u.processContainersConcurrently(ctx, filtered)
 
 	// Summarize results
@@ -92,6 +112,147 @@ func (u *Updater) Run() error {
 	duration := time.Since(startTime)
 	log.Infof("Update check complete: %d updated, %d failed, took %s", updated, failed, duration.Round(time.Millisecond))
 
+	// Self-update LAST - after all other containers are done
+	if selfContainer != nil && selfContainer.UpdateEnabled() {
+		u.handleSelfUpdate(ctx, *selfContainer)
+	}
+
+	return nil
+}
+
+// handleSelfUpdate handles updating dockwarden's own container.
+// This must be the LAST operation in an update cycle.
+// Strategy: pull new image, rename self, create new container, start it, then exit.
+// Docker daemon handles the lifecycle - the new container keeps running after we exit.
+func (u *Updater) handleSelfUpdate(ctx context.Context, self docker.Container) {
+	if u.config.NoPull || u.config.MonitorOnly {
+		return
+	}
+
+	// Get the original image name from the container config, not the summary.
+	// When a tag is re-pushed, the summary's Image field becomes a raw sha256 digest.
+	selfID := u.client.GetSelfContainerID()
+	if selfID == "" {
+		selfID = self.ID
+	}
+	inspected, err := u.client.GetContainer(ctx, selfID)
+	if err != nil {
+		log.Errorf("Self-update: failed to inspect self: %v", err)
+		return
+	}
+
+	imageName := inspected.Image
+	if imageName == "" || strings.HasPrefix(imageName, "sha256:") {
+		imageName = self.Image
+	}
+
+	// Only skip digest-pinned images
+	if isDigestPinned(imageName) {
+		return
+	}
+
+	// If still a raw digest, we can't pull by tag. Skip.
+	if strings.HasPrefix(imageName, "sha256:") {
+		log.Debugf("Self-update: cannot determine image tag from %s, skipping", truncateID(imageName))
+		return
+	}
+
+	// The running container's ImageID is the definitive source of what's currently running.
+	// We compare it against the ImageID of the newly pulled image tag.
+	currentImageID := inspected.ImageID
+
+	if err := u.client.PullImage(ctx, imageName); err != nil {
+		log.Errorf("Self-update: failed to pull image: %v", err)
+		return
+	}
+
+	// Get the image ID that the tag now points to after pulling
+	newImageID, err := u.client.GetImageID(ctx, imageName)
+	if err != nil {
+		log.Errorf("Self-update: failed to get new image ID: %v", err)
+		return
+	}
+
+	if currentImageID == newImageID {
+		log.Debugf("DockWarden is up to date")
+		return
+	}
+
+	log.Infof("DockWarden update available (%s -> %s)! Performing self-update...", truncateID(currentImageID), truncateID(newImageID))
+
+	// Self-update strategy: we CANNOT stop ourselves first (that kills our process).
+	// Instead: rename self -> create new container with original name -> start new -> exit.
+	timeout := self.GetStopTimeout(u.config.StopTimeout)
+	if err := u.selfRecreate(ctx, selfID, imageName, timeout); err != nil {
+		log.Errorf("Self-update failed: %v", err)
+		return
+	}
+
+	log.Info("Self-update complete. New DockWarden container started. Exiting old instance...")
+
+	// Clean exit - the new container is already running
+	os.Exit(0)
+}
+
+// selfRecreate orchestrates the self-update using a helper container.
+// Flow: rename self -> create clone (not started) -> launch helper -> exit.
+// The helper container waits for us to stop, starts the clone, cleans up.
+func (u *Updater) selfRecreate(ctx context.Context, selfID, imageName string, timeout time.Duration) error {
+	// Inspect self to get the original name
+	self, err := u.client.GetContainer(ctx, selfID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect self: %w", err)
+	}
+
+	originalName := self.Name
+
+	// Step 1: Rename self to free up the original name
+	tempName := originalName + "-old"
+	if err := u.client.RenameContainer(ctx, selfID, tempName); err != nil {
+		return fmt.Errorf("failed to rename self: %w", err)
+	}
+	log.Infof("Renamed self from %s to %s", originalName, tempName)
+
+	// Step 2: Clone self as a new container with the original name (not started).
+	// The clone uses inspect config, so Config.Image is the tag name which now
+	// resolves to the newly pulled image.
+	cloneID, err := u.client.CloneContainer(ctx, selfID, originalName)
+	if err != nil {
+		// Undo rename on failure
+		_ = u.client.RenameContainer(ctx, selfID, originalName)
+		return fmt.Errorf("failed to create clone: %w", err)
+	}
+	log.Infof("Created clone container %s (not started yet)", truncateID(cloneID))
+
+	// Step 3: Find Docker socket bind mount from our own container
+	dockerSocketBind := "/var/run/docker.sock:/var/run/docker.sock"
+	if binds, err := u.client.GetContainerBinds(ctx, selfID); err == nil {
+		for _, b := range binds {
+			if strings.Contains(b, "docker.sock") {
+				dockerSocketBind = b
+				break
+			}
+		}
+	}
+
+	// Step 4: Launch helper container to complete the update after we exit.
+	// The helper runs our same binary with the "take-over" command.
+	helperCmd := []string{
+		"take-over",
+		"--wait", selfID,
+		"--start", cloneID,
+		"--cleanup", selfID,
+	}
+
+	helperID, err := u.client.CreateHelperContainer(ctx, imageName, helperCmd, []string{dockerSocketBind})
+	if err != nil {
+		// Undo: remove clone and rename back
+		_ = u.client.RemoveContainer(ctx, cloneID)
+		_ = u.client.RenameContainer(ctx, selfID, originalName)
+		return fmt.Errorf("failed to launch takeover helper: %w", err)
+	}
+
+	log.Infof("Launched takeover helper %s - will start clone after we exit", truncateID(helperID))
 	return nil
 }
 
@@ -100,10 +261,9 @@ func (u *Updater) processContainersConcurrently(ctx context.Context, containers 
 	resultsChan := make(chan UpdateResult, len(containers))
 	var wg sync.WaitGroup
 
-	// Determine concurrency limit - higher for faster checks
 	maxConcurrency := 10
 	if u.config.RollingRestart {
-		maxConcurrency = 1 // Sequential for rolling restart
+		maxConcurrency = 1
 	}
 	semaphore := make(chan struct{}, maxConcurrency)
 
@@ -117,7 +277,6 @@ func (u *Updater) processContainersConcurrently(ctx context.Context, containers 
 		go func(container docker.Container) {
 			defer wg.Done()
 
-			// Acquire semaphore
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
@@ -126,13 +285,11 @@ func (u *Updater) processContainersConcurrently(ctx context.Context, containers 
 		}(ctr)
 	}
 
-	// Wait for all goroutines and close channel
 	go func() {
 		wg.Wait()
 		close(resultsChan)
 	}()
 
-	// Collect results
 	var results []UpdateResult
 	for result := range resultsChan {
 		results = append(results, result)
@@ -149,7 +306,6 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container) Up
 		OldImageID:    ctr.ImageID,
 	}
 
-	// Check for update
 	needsUpdate, err := u.checkForUpdate(ctx, ctr)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to check for updates: %w", err)
@@ -161,13 +317,11 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container) Up
 		return result
 	}
 
-	// Monitor only mode
 	if u.config.MonitorOnly {
 		log.Infof("Update available for %s (monitor only mode)", ctr.Name)
 		return result
 	}
 
-	// Perform update
 	if err := u.updateContainer(ctx, ctr); err != nil {
 		result.Error = fmt.Errorf("failed to update: %w", err)
 		return result
@@ -175,7 +329,6 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container) Up
 
 	result.Updated = true
 
-	// Get new image ID
 	newCtr, err := u.client.GetContainer(ctx, ctr.ID)
 	if err == nil {
 		result.NewImageID = newCtr.ImageID
@@ -184,18 +337,12 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container) Up
 	return result
 }
 
-// filterContainers returns containers that should be managed
+// filterContainers returns containers that should be managed (excludes self)
 func (u *Updater) filterContainers(containers []docker.Container) []docker.Container {
 	filtered := make([]docker.Container, 0, len(containers))
 
 containerLoop:
 	for _, ctr := range containers {
-		// Skip dockwarden's own container to prevent self-update suicide
-		if isSelfContainer(ctr) {
-			log.Debugf("Skipping %s: self-update protection (dockwarden container)", ctr.Name)
-			continue
-		}
-
 		// Skip disabled containers
 		for _, disabled := range u.config.DisableContainers {
 			if ctr.Name == disabled {
@@ -234,30 +381,27 @@ func (u *Updater) checkForUpdate(ctx context.Context, ctr docker.Container) (boo
 		return false, nil
 	}
 
-	// Skip pulling if image has a pinned tag (specific version that won't change)
-	if isPinnedTag(ctr.Image) {
-		log.Debugf("Skipping pull for %s: image has pinned tag", ctr.Name)
+	// Only skip digest-pinned images (sha256 references that can never change)
+	// ALL tags including version tags should be pulled to check for updates
+	if isDigestPinned(ctr.Image) {
+		log.Debugf("Skipping pull for %s: image pinned by digest", ctr.Name)
 		return false, nil
 	}
 
-	// Get current image digest
 	currentDigest, err := u.client.GetImageDigest(ctx, ctr.Image)
 	if err != nil {
 		return false, fmt.Errorf("failed to get current digest: %w", err)
 	}
 
-	// Pull latest image
 	if err := u.client.PullImage(ctx, ctr.Image); err != nil {
 		return false, fmt.Errorf("failed to pull image: %w", err)
 	}
 
-	// Get new image digest
 	newDigest, err := u.client.GetImageDigest(ctx, ctr.Image)
 	if err != nil {
 		return false, fmt.Errorf("failed to get new digest: %w", err)
 	}
 
-	// Compare digests
 	if currentDigest != newDigest {
 		log.Debugf("Container %s has update: %s -> %s", ctr.Name, truncateID(currentDigest), truncateID(newDigest))
 		return true, nil
@@ -273,17 +417,14 @@ func (u *Updater) updateContainer(ctx context.Context, ctr docker.Container) err
 
 	log.Infof("Updating container %s", ctr.Name)
 
-	// Recreate container with new image
 	_, err := u.client.RecreateContainer(ctx, ctr.ID, timeout)
 	if err != nil {
 		return fmt.Errorf("failed to recreate container: %w", err)
 	}
 
-	// Cleanup old image if enabled
 	if u.config.Cleanup && oldImageID != "" {
 		log.Debugf("Cleaning up old image %s", truncateID(oldImageID))
 		if err := u.client.RemoveImage(ctx, oldImageID); err != nil {
-			// Not a fatal error, just log it
 			log.Debugf("Failed to remove old image %s: %v", truncateID(oldImageID), err)
 		}
 	}
@@ -311,7 +452,6 @@ func (u *Updater) GetStats() map[string]interface{} {
 	}
 }
 
-// truncateID truncates an ID to 12 characters
 func truncateID(id string) string {
 	if len(id) > 12 {
 		return id[:12]
@@ -319,99 +459,45 @@ func truncateID(id string) string {
 	return id
 }
 
-// isPinnedTag checks if an image reference uses a pinned tag that won't change.
-// Pinned tags include:
-// - Digest references (image@sha256:...)
-// - Semantic versions (v1.2.3, 1.2.3, 14.4-bullseye, etc.)
-// - Release tags (RELEASE.2025-04-22T22-12-26Z, etc.)
-// Floating tags that should be pulled:
-// - latest, edge, main, master, dev, develop, nightly, stable, beta, alpha
-func isPinnedTag(imageName string) bool {
-	// Check if it's a digest reference - always pinned
-	if strings.Contains(imageName, "@sha256:") {
-		return true
-	}
-
-	// Extract the tag from the image name
-	tag := extractTag(imageName)
-	if tag == "" {
-		return false // No tag means :latest implicitly
-	}
-
-	// Floating tags that can change - should be pulled
-	floatingTags := []string{
-		"latest",
-		"edge",
-		"main",
-		"master",
-		"dev",
-		"develop",
-		"development",
-		"nightly",
-		"stable",
-		"beta",
-		"alpha",
-		"canary",
-		"rc",
-		"next",
-		"preview",
-	}
-
-	tagLower := strings.ToLower(tag)
-	for _, floating := range floatingTags {
-		if tagLower == floating {
-			return false
-		}
-	}
-
-	// If the tag contains version-like patterns, it's likely pinned
-	// Patterns: v1.2.3, 1.2.3, 14.4, RELEASE.xxx, sha-xxx, etc.
-	return true
+// isDigestPinned checks if an image is pinned by sha256 digest.
+// Only digest-pinned images are skipped. ALL tagged images (including
+// version tags like v1.2.3, latest-beta, etc.) are always pulled to
+// check for updates, since any tag could have been re-pushed.
+func isDigestPinned(imageName string) bool {
+	return strings.Contains(imageName, "@sha256:")
 }
 
 // extractTag extracts the tag from an image name
-// Examples:
-//   - nginx:1.21 -> 1.21
-//   - ghcr.io/org/image:v1.0.0 -> v1.0.0
-//   - nginx -> "" (empty, implies latest)
-//   - nginx:latest -> latest
 func extractTag(imageName string) string {
-	// Handle digest references
 	if idx := strings.Index(imageName, "@"); idx != -1 {
 		imageName = imageName[:idx]
 	}
 
-	// Find the last colon that's not part of a port
 	lastColon := strings.LastIndex(imageName, ":")
 	if lastColon == -1 {
-		return "" // No tag
+		return ""
 	}
 
-	// Check if this colon is part of a registry port (e.g., localhost:5000/image)
 	afterColon := imageName[lastColon+1:]
 	if strings.Contains(afterColon, "/") {
-		return "" // The colon was part of registry:port, no tag
+		return ""
 	}
 
 	return afterColon
 }
 
 // isSelfContainer checks if a container is the dockwarden container itself.
-// This prevents dockwarden from updating and killing itself.
 func isSelfContainer(ctr docker.Container) bool {
-	// Check by container name
 	nameLower := strings.ToLower(ctr.Name)
 	if strings.Contains(nameLower, "dockwarden") {
 		return true
 	}
 
-	// Check by image name
 	imageLower := strings.ToLower(ctr.Image)
 	if strings.Contains(imageLower, "dockwarden") {
 		return true
 	}
 
-	// Check by label - allow explicit override
 	if ctr.GetLabel("dockwarden.self") == "true" {
 		return true
 	}

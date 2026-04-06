@@ -1,11 +1,36 @@
 <table class="min-w-full divide-y divide-gray-700">
     <thead class="bg-gray-900">
         <tr>
-            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Name</th>
-            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Image</th>
-            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Status</th>
-            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Health</th>
-            <th scope="col" class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider">Actions</th>
+            <th
+                scope="col"
+                class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider"
+            >
+                Name
+            </th>
+            <th
+                scope="col"
+                class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider"
+            >
+                Image
+            </th>
+            <th
+                scope="col"
+                class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider"
+            >
+                Status
+            </th>
+            <th
+                scope="col"
+                class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider"
+            >
+                Health
+            </th>
+            <th
+                scope="col"
+                class="px-6 py-3 text-left text-xs font-medium text-gray-400 uppercase tracking-wider"
+            >
+                Actions
+            </th>
         </tr>
     </thead>
     <tbody class="bg-gray-800 divide-y divide-gray-700">
@@ -13,46 +38,117 @@
         <tr class="hover:bg-gray-750">
             <td class="px-6 py-4 whitespace-nowrap">
                 <div class="text-sm font-medium text-white">{{.Name}}</div>
-                <div class="text-xs text-gray-500 font-mono">{{slice .ID 0 12}}</div>
+                <div class="text-xs text-gray-500 font-mono">
+                    {{slice .ID 0 12}}
+                </div>
             </td>
             <td class="px-6 py-4 whitespace-nowrap">
                 <div class="text-sm text-gray-300 font-mono">{{.Image}}</div>
             </td>
             <td class="px-6 py-4 whitespace-nowrap">
                 {{if eq .State "running"}}
-                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900 text-green-300">
+                <span
+                    class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900 text-green-300"
+                >
                     Running
                 </span>
                 {{else if eq .State "exited"}}
-                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300">
+                <span
+                    class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-700 text-gray-300"
+                >
                     Exited
                 </span>
                 {{else}}
-                <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-900 text-yellow-300">
+                <span
+                    class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-900 text-yellow-300"
+                >
                     {{.State}}
                 </span>
                 {{end}}
             </td>
             <td class="px-6 py-4 whitespace-nowrap">
                 {{if eq .HealthStatus "healthy"}}
-                <span class="text-green-400">● Healthy</span>
+                <span class="text-green-400">&#x25CF; Healthy</span>
                 {{else if eq .HealthStatus "unhealthy"}}
-                <span class="text-red-400">● Unhealthy</span>
+                <span class="text-red-400">&#x25CF; Unhealthy</span>
                 {{else if eq .HealthStatus "starting"}}
-                <span class="text-yellow-400">● Starting</span>
+                <span class="text-yellow-400">&#x25CF; Starting</span>
                 {{else}}
-                <span class="text-gray-500">—</span>
+                <span class="text-gray-500">&mdash;</span>
                 {{end}}
             </td>
             <td class="px-6 py-4 whitespace-nowrap text-sm">
-                <button 
-                    hx-post="/ui/containers/{{.ID}}/restart"
-                    hx-swap="outerHTML"
-                    hx-confirm="Restart container {{.Name}}?"
-                    class="text-blue-400 hover:text-blue-300 font-medium"
+                <div class="flex items-center space-x-3">
+                    <button
+                        hx-post="/ui/containers/{{.ID}}/restart"
+                        hx-target="#action-result-{{slice .ID 0 12}}"
+                        hx-swap="innerHTML"
+                        hx-confirm="Restart container {{.Name}}?"
+                        class="text-blue-400 hover:text-blue-300 font-medium"
+                    >
+                        Restart
+                    </button>
+                    {{if eq .State "running"}}
+                    <button
+                        hx-post="/ui/containers/{{.ID}}/stop"
+                        hx-target="#action-result-{{slice .ID 0 12}}"
+                        hx-swap="innerHTML"
+                        hx-confirm="Stop container {{.Name}}?"
+                        class="text-yellow-400 hover:text-yellow-300 font-medium"
+                    >
+                        Stop
+                    </button>
+                    {{end}}
+                    <button
+                        hx-post="/ui/containers/{{.ID}}/recreate"
+                        hx-target="#action-result-{{slice .ID 0 12}}"
+                        hx-swap="innerHTML"
+                        hx-confirm="Recreate container {{.Name}}? This will stop, remove, and create a new container."
+                        class="text-purple-400 hover:text-purple-300 font-medium"
+                    >
+                        Recreate
+                    </button>
+                    <button
+                        onclick="toggleLogs('{{.ID}}', '{{.Name}}')"
+                        class="text-gray-400 hover:text-gray-300 font-medium"
+                    >
+                        Logs
+                    </button>
+                    <span
+                        id="action-result-{{slice .ID 0 12}}"
+                        class="text-xs"
+                    ></span>
+                </div>
+            </td>
+        </tr>
+        <!-- Expandable logs row -->
+        <tr id="logs-row-{{.ID}}" class="hidden">
+            <td colspan="5" class="px-6 py-4 bg-gray-900">
+                <div class="flex items-center justify-between mb-2">
+                    <span class="text-sm font-medium text-gray-300"
+                        >Logs: {{.Name}}</span
+                    >
+                    <div class="flex items-center space-x-2">
+                        <button
+                            onclick="refreshLogs('{{.ID}}')"
+                            class="text-xs text-blue-400 hover:text-blue-300"
+                        >
+                            Refresh
+                        </button>
+                        <button
+                            onclick="toggleLogs('{{.ID}}', '{{.Name}}')"
+                            class="text-xs text-gray-400 hover:text-gray-300"
+                        >
+                            Close
+                        </button>
+                    </div>
+                </div>
+                <pre
+                    id="logs-content-{{.ID}}"
+                    class="bg-black rounded p-3 text-xs text-green-400 font-mono overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap"
                 >
-                    Restart
-                </button>
+Loading...</pre
+                >
             </td>
         </tr>
         {{else}}
@@ -64,3 +160,31 @@
         {{end}}
     </tbody>
 </table>
+
+<script>
+    function toggleLogs(containerId, containerName) {
+        var row = document.getElementById("logs-row-" + containerId);
+        if (row.classList.contains("hidden")) {
+            row.classList.remove("hidden");
+            refreshLogs(containerId);
+        } else {
+            row.classList.add("hidden");
+        }
+    }
+
+    function refreshLogs(containerId) {
+        var pre = document.getElementById("logs-content-" + containerId);
+        pre.textContent = "Loading...";
+        fetch("/ui/containers/" + containerId + "/logs?tail=200")
+            .then(function (r) {
+                return r.text();
+            })
+            .then(function (text) {
+                pre.textContent = text || "(no logs)";
+                pre.scrollTop = pre.scrollHeight;
+            })
+            .catch(function (err) {
+                pre.textContent = "Error loading logs: " + err;
+            });
+    }
+</script>

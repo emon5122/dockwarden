@@ -23,6 +23,7 @@ type containerState struct {
 	restartAttempts int
 	lastImageID     string
 	gaveUp          bool
+	lastSeenRunning bool
 	mu              sync.Mutex
 }
 
@@ -100,8 +101,9 @@ func (w *Watcher) getContainerState(containerID string) *containerState {
 func (w *Watcher) checkHealthConcurrently() {
 	ctx := context.Background()
 
+	// List ALL containers including stopped to detect crashed ones
 	containers, err := w.client.ListContainers(ctx, docker.ListOptions{
-		All:           false,
+		All:           true,
 		IncludeHealth: true,
 	})
 	if err != nil {
@@ -157,6 +159,18 @@ func (w *Watcher) processContainer(ctx context.Context, ctr docker.Container) {
 	if state.gaveUp {
 		log.Debugf("Container %s: gave up after %d attempts, waiting for new version", ctr.Name, MaxRestartAttempts)
 		return
+	}
+
+	// Detect crashed/exited containers that were previously running
+	if !ctr.IsRunning() && state.lastSeenRunning {
+		log.Warnf("Container %s has stopped unexpectedly (state: %s)", ctr.Name, ctr.State)
+		w.handleCrashed(ctx, ctr, state)
+		return
+	}
+
+	// Track running state
+	if ctr.IsRunning() {
+		state.lastSeenRunning = true
 	}
 
 	// Handle unhealthy containers
@@ -218,6 +232,36 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 	}
 }
 
+// handleCrashed handles a container that has stopped unexpectedly
+func (w *Watcher) handleCrashed(ctx context.Context, ctr docker.Container, state *containerState) {
+	log.Warnf("Container %s crashed/exited (attempt %d/%d)", ctr.Name, state.restartAttempts+1, MaxRestartAttempts)
+
+	if state.restartAttempts >= MaxRestartAttempts {
+		log.Errorf("Container %s: giving up after %d restart attempts for crashed container. Will retry when new version is available.", ctr.Name, MaxRestartAttempts)
+		state.gaveUp = true
+		state.lastSeenRunning = false
+
+		if w.notifier != nil {
+			w.notifier.NotifyContainerGaveUp(ctr.Name, ctr.Image, MaxRestartAttempts)
+		}
+		return
+	}
+
+	state.restartAttempts++
+
+	if w.notifier != nil {
+		w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
+	}
+
+	// Start the exited container
+	log.Infof("Starting crashed container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
+	if err := w.client.StartContainer(ctx, ctr.ID); err != nil {
+		log.Errorf("Failed to start crashed container %s: %v", ctr.Name, err)
+	} else {
+		log.Infof("Started crashed container %s", ctr.Name)
+	}
+}
+
 // ResetContainer resets tracking for a container (called when container is updated)
 func (w *Watcher) ResetContainer(containerID string) {
 	w.statesMu.Lock()
@@ -228,6 +272,7 @@ func (w *Watcher) ResetContainer(containerID string) {
 		state.restartAttempts = 0
 		state.gaveUp = false
 		state.lastImageID = ""
+		state.lastSeenRunning = false
 		state.mu.Unlock()
 	}
 }
