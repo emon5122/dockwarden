@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.1.1](https://github.com/emon5122/dockwarden/compare/v1.1.0...v1.1.1) (2026-04-06)
+
+
+### Bug Fixes
+
+* **deps:** update module github.com/gin-gonic/gin to v1.12.0 ([c74bc00](https://github.com/emon5122/dockwarden/commit/c74bc00b2a8ab99624512cc58dfd0d3bb1cd3b36))
+* **deps:** update module github.com/gin-gonic/gin to v1.12.0 ([980d435](https://github.com/emon5122/dockwarden/commit/980d4351edf587b2eac34bf9f12b66706b3377a8))
+* **deps:** update module github.com/sirupsen/logrus to v1.9.4 ([8846cd4](https://github.com/emon5122/dockwarden/commit/8846cd491e553ddc31f51d3645d560694a4c3679))
+* **deps:** update module github.com/sirupsen/logrus to v1.9.4 ([8aa1425](https://github.com/emon5122/dockwarden/commit/8aa14256b3d84143b20fe0f552d568b229cd0d39))
+* **deps:** update module github.com/spf13/viper to v1.21.0 ([a19b89c](https://github.com/emon5122/dockwarden/commit/a19b89c2e76773b215cb9b81865b0e29d96aafd0))
+* **deps:** update module github.com/spf13/viper to v1.21.0 ([88f1c9f](https://github.com/emon5122/dockwarden/commit/88f1c9fc20e66d4f0246e559e09bc257fb72ab87))
+
 ## [1.1.0](https://github.com/emon5122/dockwarden/compare/v1.0.7...v1.1.0) (2026-04-06)
 
 
