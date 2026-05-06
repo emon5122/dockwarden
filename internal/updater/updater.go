@@ -112,6 +112,12 @@ func (u *Updater) Run() error {
 	duration := time.Since(startTime)
 	log.Infof("Update check complete: %d updated, %d failed, took %s", updated, failed, duration.Round(time.Millisecond))
 
+	// Clean up any stale containers left by previous failed self-updates
+	// (dockwarden-old, dockwarden-old-old, ...) before doing anything else.
+	if selfContainer != nil {
+		u.cleanupStaleContainers(ctx, selfContainer.Name)
+	}
+
 	// Self-update LAST - after all other containers are done
 	if selfContainer != nil && selfContainer.UpdateEnabled() {
 		u.handleSelfUpdate(ctx, *selfContainer)
@@ -127,6 +133,15 @@ func (u *Updater) Run() error {
 func (u *Updater) handleSelfUpdate(ctx context.Context, self docker.Container) {
 	if u.config.NoPull || u.config.MonitorOnly {
 		return
+	}
+
+	// Defensive guard: if this container's name already ends with "-old" it is a
+	// stale instance that was restarted by Docker's restart policy after a rename.
+	// Proceeding would create another "-old-old" layer. Bail out immediately;
+	// the real dockwarden (or the startup cleanup) will handle removal.
+	if strings.HasSuffix(self.Name, "-old") {
+		log.Warnf("Self-update skipped: running as renamed container %q — likely a restart-policy loop. Exiting to let the active instance take over.", self.Name)
+		os.Exit(0)
 	}
 
 	// Get the original image name from the container config, not the summary.
@@ -206,14 +221,19 @@ func (u *Updater) selfRecreate(ctx context.Context, selfID, imageName string, ti
 
 	originalName := self.Name
 
-	// Step 1: Rename self to free up the original name
+	// Step 1: Remove any stale containers left by previous failed self-updates
+	// (e.g. dockwarden-old, dockwarden-old-old, ...) so the rename below can't
+	// collide with them and so the system is left in a clean state.
+	u.cleanupStaleContainers(ctx, originalName)
+
+	// Step 2 (was Step 1): Rename self to free up the original name
 	tempName := originalName + "-old"
 	if err := u.client.RenameContainer(ctx, selfID, tempName); err != nil {
 		return fmt.Errorf("failed to rename self: %w", err)
 	}
 	log.Infof("Renamed self from %s to %s", originalName, tempName)
 
-	// Step 2: Clone self as a new container with the original name (not started).
+	// Step 3: Clone self as a new container with the original name (not started).
 	// The clone uses inspect config, so Config.Image is the tag name which now
 	// resolves to the newly pulled image.
 	cloneID, err := u.client.CloneContainer(ctx, selfID, originalName)
@@ -224,7 +244,7 @@ func (u *Updater) selfRecreate(ctx context.Context, selfID, imageName string, ti
 	}
 	log.Infof("Created clone container %s (not started yet)", truncateID(cloneID))
 
-	// Step 3: Find Docker socket bind mount from our own container
+	// Step 4: Find Docker socket bind mount from our own container
 	dockerSocketBind := "/var/run/docker.sock:/var/run/docker.sock"
 	if binds, err := u.client.GetContainerBinds(ctx, selfID); err == nil {
 		for _, b := range binds {
@@ -235,11 +255,10 @@ func (u *Updater) selfRecreate(ctx context.Context, selfID, imageName string, ti
 		}
 	}
 
-	// Step 4: Launch helper container to complete the update after we exit.
+	// Step 5: Launch helper container to complete the update after we exit.
 	// The helper runs our same binary with the "take-over" command.
 	helperCmd := []string{
 		"take-over",
-		"--wait", selfID,
 		"--start", cloneID,
 		"--cleanup", selfID,
 	}
@@ -503,4 +522,27 @@ func isSelfContainer(ctr docker.Container) bool {
 	}
 
 	return false
+}
+
+// cleanupStaleContainers removes stopped or running containers whose names match
+// the "{originalName}-old*" pattern — the debris left behind when Docker's restart
+// policy restarts an already-renamed container during a self-update cycle.
+func (u *Updater) cleanupStaleContainers(ctx context.Context, originalName string) {
+	prefix := originalName + "-old"
+
+	containers, err := u.client.ListContainers(ctx, docker.ListOptions{All: true})
+	if err != nil {
+		log.Debugf("cleanupStaleContainers: failed to list containers: %v", err)
+		return
+	}
+
+	for _, ctr := range containers {
+		if !strings.HasPrefix(ctr.Name, prefix) {
+			continue
+		}
+		log.Infof("Removing stale container %s left by a previous self-update", ctr.Name)
+		if err := u.client.RemoveContainer(ctx, ctr.ID); err != nil {
+			log.Warnf("Failed to remove stale container %s: %v", ctr.Name, err)
+		}
+	}
 }

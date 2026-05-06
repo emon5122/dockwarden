@@ -12,12 +12,14 @@ import (
 
 var takeOverCmd = &cobra.Command{
 	Use:    "take-over",
-	Short:  "Internal: wait for old container to stop, then start new container",
+	Short:  "Internal: force-remove old container then start new container",
 	Hidden: true,
 	Run:    runTakeOver,
 }
 
 var (
+	// waitContainerID is kept for backward-compatibility with in-flight helpers
+	// that were launched before this fix; the value is ignored.
 	waitContainerID    string
 	startContainerID   string
 	cleanupContainerID string
@@ -25,9 +27,9 @@ var (
 
 func init() {
 	rootCmd.AddCommand(takeOverCmd)
-	takeOverCmd.Flags().StringVar(&waitContainerID, "wait", "", "Container ID to wait for stop")
+	takeOverCmd.Flags().StringVar(&waitContainerID, "wait", "", "Deprecated: no longer used")
 	takeOverCmd.Flags().StringVar(&startContainerID, "start", "", "Container ID to start")
-	takeOverCmd.Flags().StringVar(&cleanupContainerID, "cleanup", "", "Container ID to remove after")
+	takeOverCmd.Flags().StringVar(&cleanupContainerID, "cleanup", "", "Container ID to remove")
 }
 
 func runTakeOver(cmd *cobra.Command, args []string) {
@@ -36,8 +38,8 @@ func runTakeOver(cmd *cobra.Command, args []string) {
 		TimestampFormat: "2006-01-02 15:04:05",
 	})
 
-	if waitContainerID == "" || startContainerID == "" {
-		log.Fatal("take-over: --wait and --start flags are required")
+	if startContainerID == "" {
+		log.Fatal("take-over: --start flag is required")
 	}
 
 	ctx := context.Background()
@@ -47,26 +49,22 @@ func runTakeOver(cmd *cobra.Command, args []string) {
 		log.Fatalf("take-over: failed to create Docker client: %v", err)
 	}
 
-	log.Infof("take-over: waiting for container %s to stop...", fmtID(waitContainerID))
-
-	// Poll until the old container stops or is removed
-	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
-		result, err := cli.ContainerInspect(ctx, waitContainerID, dockerclient.ContainerInspectOptions{})
-		if err != nil {
-			// Container removed or not found - proceed
-			log.Infof("take-over: old container gone: %v", err)
-			break
-		}
-		if result.Container.State == nil || !result.Container.State.Running {
-			log.Info("take-over: old container stopped")
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	// Brief delay to ensure Docker frees the port bindings
+	// Brief delay to ensure the old dockwarden process has exited.
 	time.Sleep(2 * time.Second)
+
+	// Force-remove the old container BEFORE starting the new one.
+	// This is critical: if the old container has a restart policy (always/unless-stopped),
+	// simply waiting for it to stop is not enough — Docker will keep restarting it, which
+	// causes it to run a new update cycle and produce dockwarden-old-old-old chains.
+	// Force-removing immediately prevents any further restarts.
+	if cleanupContainerID != "" {
+		log.Infof("take-over: force-removing old container %s...", fmtID(cleanupContainerID))
+		if _, err := cli.ContainerRemove(ctx, cleanupContainerID, dockerclient.ContainerRemoveOptions{Force: true}); err != nil {
+			log.Warnf("take-over: cleanup failed (non-fatal): %v", err)
+		} else {
+			log.Info("take-over: old container removed")
+		}
+	}
 
 	// Start the new container
 	log.Infof("take-over: starting container %s...", fmtID(startContainerID))
@@ -74,16 +72,6 @@ func runTakeOver(cmd *cobra.Command, args []string) {
 		log.Fatalf("take-over: failed to start new container: %v", err)
 	}
 	log.Info("take-over: new container started successfully")
-
-	// Clean up the old container
-	if cleanupContainerID != "" {
-		log.Infof("take-over: removing old container %s...", fmtID(cleanupContainerID))
-		if _, err := cli.ContainerRemove(ctx, cleanupContainerID, dockerclient.ContainerRemoveOptions{Force: true}); err != nil {
-			log.Warnf("take-over: cleanup failed (non-fatal): %v", err)
-		} else {
-			log.Info("take-over: old container removed")
-		}
-	}
 
 	log.Info("take-over: self-update complete")
 }
