@@ -184,6 +184,8 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 
 	containerName := strings.TrimPrefix(inspect.Name, "/")
 	oldImageID := inspect.Image
+	createConfig := cloneContainerConfig(inspect.Config)
+	c.refreshImageEnvDefaults(ctx, oldImageID, createConfig)
 
 	log.Debugf("Recreating container %s with latest image", containerName)
 
@@ -229,7 +231,7 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 
 	// Create new container with same config
 	createResult, err := c.api.ContainerCreate(ctx, dockerclient.ContainerCreateOptions{
-		Config:           inspect.Config,
+		Config:           createConfig,
 		HostConfig:       inspect.HostConfig,
 		NetworkingConfig: networkingConfig,
 		Name:             containerName,
@@ -354,6 +356,8 @@ func (c *dockerClient) CloneContainer(ctx context.Context, id string, newName st
 		return "", fmt.Errorf("failed to inspect container %s: %w", id, err)
 	}
 	inspect := inspectResult.Container
+	createConfig := cloneContainerConfig(inspect.Config)
+	c.refreshImageEnvDefaults(ctx, inspect.Image, createConfig)
 
 	log.Debugf("Cloning container %s as %s", strings.TrimPrefix(inspect.Name, "/"), newName)
 
@@ -377,7 +381,7 @@ func (c *dockerClient) CloneContainer(ctx context.Context, id string, newName st
 
 	// Create new container with same config
 	createResult, err := c.api.ContainerCreate(ctx, dockerclient.ContainerCreateOptions{
-		Config:           inspect.Config,
+		Config:           createConfig,
 		HostConfig:       inspect.HostConfig,
 		NetworkingConfig: networkingConfig,
 		Name:             newName,
@@ -446,6 +450,89 @@ func (c *dockerClient) CreateHelperContainer(ctx context.Context, image string, 
 
 	log.Debugf("Started helper container %s (%s)", name, truncateID(createResult.ID))
 	return createResult.ID, nil
+}
+
+func (c *dockerClient) refreshImageEnvDefaults(ctx context.Context, oldImageID string, config *container.Config) {
+	if config == nil || oldImageID == "" {
+		return
+	}
+
+	inspect, err := c.api.ImageInspect(ctx, oldImageID)
+	if err != nil {
+		log.Debugf("Keeping existing container env: failed to inspect old image %s: %v", truncateID(oldImageID), err)
+		return
+	}
+	if inspect.Config == nil || len(inspect.Config.Env) == 0 {
+		return
+	}
+
+	originalLen := len(config.Env)
+	config.Env = stripInheritedImageEnv(config.Env, inspect.Config.Env)
+	if removed := originalLen - len(config.Env); removed > 0 {
+		log.Debugf("Removed %d inherited image environment entries before recreate", removed)
+	}
+}
+
+func cloneContainerConfig(config *container.Config) *container.Config {
+	if config == nil {
+		return &container.Config{}
+	}
+
+	clone := *config
+	clone.Env = append([]string(nil), config.Env...)
+	if config.Labels != nil {
+		clone.Labels = make(map[string]string, len(config.Labels))
+		for key, value := range config.Labels {
+			clone.Labels[key] = value
+		}
+	}
+
+	return &clone
+}
+
+func stripInheritedImageEnv(containerEnv []string, oldImageEnv []string) []string {
+	if len(containerEnv) == 0 || len(oldImageEnv) == 0 {
+		return containerEnv
+	}
+
+	oldDefaults := envMap(oldImageEnv)
+	refreshed := make([]string, 0, len(containerEnv))
+	for _, entry := range containerEnv {
+		key, value, ok := splitEnv(entry)
+		if !ok {
+			refreshed = append(refreshed, entry)
+			continue
+		}
+
+		if oldValue, inherited := oldDefaults[key]; inherited && value == oldValue {
+			continue
+		}
+
+		refreshed = append(refreshed, entry)
+	}
+
+	return refreshed
+}
+
+func envMap(env []string) map[string]string {
+	values := make(map[string]string, len(env))
+	for _, entry := range env {
+		key, value, ok := splitEnv(entry)
+		if ok {
+			values[key] = value
+		}
+	}
+
+	return values
+}
+
+func splitEnv(entry string) (string, string, bool) {
+	key, value, ok := strings.Cut(entry, "=")
+	if !ok || key == "" {
+		return "", "", false
+	}
+
+	return key, value, true
 }
 
 // GetSelfContainerID returns the container ID of the current running container (if any)
