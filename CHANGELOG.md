@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/emon5122/dockwarden/compare/v1.1.1...v1.1.2) (2026-05-06)
+
+
+### Bug Fixes
+
+* add tests for stripInheritedImageEnv function ([7356011](https://github.com/emon5122/dockwarden/commit/7356011359cb532edbb2fa407ca2606564d67135))
+
 ## [1.1.1](https://github.com/emon5122/dockwarden/compare/v1.1.0...v1.1.1) (2026-04-06)
 
 
