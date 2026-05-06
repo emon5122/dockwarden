@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.3](https://github.com/emon5122/dockwarden/compare/v1.1.2...v1.1.3) (2026-05-06)
+
+
+### Bug Fixes
+
+* update take-over command to force-remove old containers and clean up stale instances ([608cd98](https://github.com/emon5122/dockwarden/commit/608cd985ad53484d205d5c7adc08ed6e5faec802))
+
 ## [1.1.2](https://github.com/emon5122/dockwarden/compare/v1.1.1...v1.1.2) (2026-05-06)
 
 
