@@ -20,11 +20,14 @@ const (
 
 // containerState tracks the state of health monitoring for a container
 type containerState struct {
-	restartAttempts int
-	lastImageID     string
-	gaveUp          bool
-	lastSeenRunning bool
-	mu              sync.Mutex
+	restartAttempts      int
+	lastImageID          string
+	gaveUp               bool
+	lastSeenRunning      bool
+	consecutiveUnhealthy int
+	observationStart     time.Time
+	observed             bool
+	mu                   sync.Mutex
 }
 
 // Watcher monitors container health and takes action using Go's native concurrency
@@ -85,9 +88,19 @@ func (w *Watcher) Stop() {
 
 // getContainerState gets or creates state for a container
 func (w *Watcher) getContainerState(containerID string) *containerState {
+	// Fast path: read-lock check
+	w.statesMu.RLock()
+	if state, ok := w.states[containerID]; ok {
+		w.statesMu.RUnlock()
+		return state
+	}
+	w.statesMu.RUnlock()
+
+	// Slow path: write-lock for creation
 	w.statesMu.Lock()
 	defer w.statesMu.Unlock()
 
+	// Double-check after acquiring write lock
 	if state, ok := w.states[containerID]; ok {
 		return state
 	}
@@ -110,6 +123,19 @@ func (w *Watcher) checkHealthConcurrently() {
 		log.Errorf("Failed to list containers for health check: %v", err)
 		return
 	}
+
+	// Build set of current container IDs to prune stale state entries
+	currentIDs := make(map[string]struct{}, len(containers))
+	for _, ctr := range containers {
+		currentIDs[ctr.ID] = struct{}{}
+	}
+	w.statesMu.Lock()
+	for id := range w.states {
+		if _, exists := currentIDs[id]; !exists {
+			delete(w.states, id)
+		}
+	}
+	w.statesMu.Unlock()
 
 	// Process containers concurrently using goroutines
 	var wg sync.WaitGroup
@@ -152,6 +178,7 @@ func (w *Watcher) processContainer(ctx context.Context, ctr docker.Container) {
 		log.Infof("Container %s has new image, resetting health tracking", ctr.Name)
 		state.restartAttempts = 0
 		state.gaveUp = false
+		state.lastSeenRunning = false
 	}
 	state.lastImageID = ctr.ImageID
 
@@ -177,58 +204,73 @@ func (w *Watcher) processContainer(ctx context.Context, ctr docker.Container) {
 	if ctr.IsUnhealthy() {
 		w.handleUnhealthy(ctx, ctr, state)
 	} else if ctr.IsHealthy() {
-		// Reset attempts if container is now healthy
+		// Reset attempts and observation counters if container is now healthy
 		if state.restartAttempts > 0 {
 			log.Infof("Container %s is now healthy after %d restart(s)", ctr.Name, state.restartAttempts)
 			state.restartAttempts = 0
 		}
+		state.consecutiveUnhealthy = 0
+		state.observed = false
 	}
 }
 
 // handleUnhealthy handles an unhealthy container with retry logic
 func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, state *containerState) {
-	log.Warnf("Container %s is unhealthy (attempt %d/%d)", ctr.Name, state.restartAttempts+1, MaxRestartAttempts)
+	// Increment consecutive unhealthy count
+	state.consecutiveUnhealthy++
+	log.Warnf("Container %s is unhealthy (check %d/%d, restart %d/%d)", ctr.Name, state.consecutiveUnhealthy, w.config.UnhealthyThreshold, state.restartAttempts+1, MaxRestartAttempts)
 
-	// Check if we've exceeded max attempts
-	if state.restartAttempts >= MaxRestartAttempts {
-		log.Errorf("Container %s: giving up after %d restart attempts. Will retry when new version is available.", ctr.Name, MaxRestartAttempts)
-		state.gaveUp = true
-
-		// Send notification about giving up
-		if w.notifier != nil {
-			w.notifier.NotifyContainerGaveUp(ctr.Name, ctr.Image, MaxRestartAttempts)
-		}
-		return
+	// If we have not yet started observation, start timer
+	if !state.observed {
+		state.observationStart = time.Now()
+		state.observed = true
+		log.Infof("Started observation period for container %s", ctr.Name)
 	}
 
-	switch w.config.HealthAction {
-	case "restart":
-		state.restartAttempts++
-		log.Infof("Restarting unhealthy container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
+	// Check if observation period has passed and threshold reached
+	if state.consecutiveUnhealthy >= w.config.UnhealthyThreshold && time.Since(state.observationStart) >= w.config.ObservationPeriod {
+		// Reset observation flags
+		state.observed = false
+		state.consecutiveUnhealthy = 0
 
-		// Send notification about unhealthy state
-		if w.notifier != nil {
-			w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
+		// Proceed with existing restart/notify logic
+		if state.restartAttempts >= MaxRestartAttempts {
+			log.Errorf("Container %s: giving up after %d restart attempts. Will retry when new version is available.", ctr.Name, MaxRestartAttempts)
+			state.gaveUp = true
+			if w.notifier != nil {
+				w.notifier.NotifyContainerGaveUp(ctr.Name, ctr.Image, MaxRestartAttempts)
+			}
+			return
 		}
 
-		timeout := ctr.GetStopTimeout(w.config.StopTimeout)
-		if err := w.client.RestartContainer(ctx, ctr.ID, timeout); err != nil {
-			log.Errorf("Failed to restart unhealthy container %s: %v", ctr.Name, err)
-		} else {
-			log.Infof("Restart initiated for container %s", ctr.Name)
+		switch w.config.HealthAction {
+		case "restart":
+			state.restartAttempts++
+			log.Infof("Restarting unhealthy container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
+
+			if w.notifier != nil {
+				w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
+			}
+
+			timeout := ctr.GetStopTimeout(w.config.StopTimeout)
+			if err := w.client.RestartContainer(ctx, ctr.ID, timeout); err != nil {
+				log.Errorf("Failed to restart unhealthy container %s: %v", ctr.Name, err)
+			} else {
+				log.Infof("Restart initiated for container %s", ctr.Name)
+			}
+
+		case "notify":
+			state.restartAttempts++
+			log.Infof("Notifying about unhealthy container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
+			if w.notifier != nil {
+				w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
+			}
+
+		default:
+			log.Debugf("No action configured for unhealthy container %s", ctr.Name)
 		}
-
-	case "notify":
-		log.Infof("Notifying about unhealthy container %s (attempt %d/%d)", ctr.Name, state.restartAttempts+1, MaxRestartAttempts)
-		state.restartAttempts++
-
-		// Send notification
-		if w.notifier != nil {
-			w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
-		}
-
-	default:
-		log.Debugf("No action configured for unhealthy container %s", ctr.Name)
+	} else {
+		log.Infof("Container %s unhealthy but within observation period (%d/%d) or threshold not met", ctr.Name, state.consecutiveUnhealthy, w.config.UnhealthyThreshold)
 	}
 }
 
@@ -253,10 +295,11 @@ func (w *Watcher) handleCrashed(ctx context.Context, ctr docker.Container, state
 		w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
 	}
 
-	// Start the exited container
+	// If start fails, reset lastSeenRunning to avoid rapid retry loops
 	log.Infof("Starting crashed container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
 	if err := w.client.StartContainer(ctx, ctr.ID); err != nil {
 		log.Errorf("Failed to start crashed container %s: %v", ctr.Name, err)
+		state.lastSeenRunning = false
 	} else {
 		log.Infof("Started crashed container %s", ctr.Name)
 	}

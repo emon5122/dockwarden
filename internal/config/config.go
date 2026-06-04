@@ -12,6 +12,9 @@ import (
 
 // Config holds all configuration for DockWarden
 type Config struct {
+	// Observation settings for health monitoring
+	ObservationPeriod  time.Duration // duration to observe before taking action
+	UnhealthyThreshold int           // number of consecutive unhealthy checks before action
 	// Operation mode
 	Mode     string // full, update, watch, monitor
 	RunOnce  bool
@@ -98,6 +101,10 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.String("health-action", "restart", "Action on unhealthy: restart, notify")
 	flags.Bool("health-check", false, "Perform health check and exit")
 
+	// Observation settings flags
+	flags.Duration("observation-period", 30*time.Second, "Duration to observe unhealthy container before action")
+	flags.Int("unhealthy-threshold", 3, "Consecutive unhealthy checks before taking action")
+
 	// Secrets
 	flags.String("registry-secret", "", "Path to registry authentication secret")
 
@@ -129,37 +136,39 @@ func RegisterFlags(cmd *cobra.Command) {
 // Load loads configuration from flags, environment, and secrets
 func Load(cmd *cobra.Command) (*Config, error) {
 	cfg := &Config{
-		Mode:              viper.GetString("mode"),
-		RunOnce:           viper.GetBool("run-once"),
-		Interval:          viper.GetDuration("interval"),
-		Schedule:          viper.GetString("schedule"),
-		Cleanup:           viper.GetBool("cleanup"),
-		NoRestart:         viper.GetBool("no-restart"),
-		NoPull:            viper.GetBool("no-pull"),
-		MonitorOnly:       viper.GetBool("monitor-only"),
-		RollingRestart:    viper.GetBool("rolling-restart"),
-		StopTimeout:       viper.GetDuration("stop-timeout"),
-		LabelEnable:       viper.GetBool("label-enable"),
-		LabelName:         viper.GetString("label-name"),
-		Scope:             viper.GetString("scope"),
-		LabelPrecedence:   viper.GetBool("label-take-precedence"),
-		IncludeStopped:    viper.GetBool("include-stopped"),
-		IncludeRestarting: viper.GetBool("include-restarting"),
-		ReviveStopped:     viper.GetBool("revive-stopped"),
-		RemoveVolumes:     viper.GetBool("remove-volumes"),
-		DisableContainers: viper.GetStringSlice("disable-containers"),
-		HealthWatch:       viper.GetBool("health-watch"),
-		HealthAction:      viper.GetString("health-action"),
-		HealthCheck:       viper.GetBool("health-check"),
-		RegistrySecret:    viper.GetString("registry-secret"),
-		NotificationURL:   viper.GetString("notification-url"),
-		APIEnabled:        viper.GetBool("api-enabled"),
-		APIPort:           viper.GetInt("api-port"),
-		APIToken:          viper.GetString("api-token"),
-		MetricsEnabled:    viper.GetBool("metrics"),
-		LogLevel:          viper.GetString("log-level"),
-		LogFormat:         viper.GetString("log-format"),
-		TZ:                os.Getenv("TZ"),
+		ObservationPeriod:  viper.GetDuration("observation-period"),
+		UnhealthyThreshold: viper.GetInt("unhealthy-threshold"),
+		Mode:               viper.GetString("mode"),
+		RunOnce:            viper.GetBool("run-once"),
+		Interval:           viper.GetDuration("interval"),
+		Schedule:           viper.GetString("schedule"),
+		Cleanup:            viper.GetBool("cleanup"),
+		NoRestart:          viper.GetBool("no-restart"),
+		NoPull:             viper.GetBool("no-pull"),
+		MonitorOnly:        viper.GetBool("monitor-only"),
+		RollingRestart:     viper.GetBool("rolling-restart"),
+		StopTimeout:        viper.GetDuration("stop-timeout"),
+		LabelEnable:        viper.GetBool("label-enable"),
+		LabelName:          viper.GetString("label-name"),
+		Scope:              viper.GetString("scope"),
+		LabelPrecedence:    viper.GetBool("label-take-precedence"),
+		IncludeStopped:     viper.GetBool("include-stopped"),
+		IncludeRestarting:  viper.GetBool("include-restarting"),
+		ReviveStopped:      viper.GetBool("revive-stopped"),
+		RemoveVolumes:      viper.GetBool("remove-volumes"),
+		DisableContainers:  viper.GetStringSlice("disable-containers"),
+		HealthWatch:        viper.GetBool("health-watch"),
+		HealthAction:       viper.GetString("health-action"),
+		HealthCheck:        viper.GetBool("health-check"),
+		RegistrySecret:     viper.GetString("registry-secret"),
+		NotificationURL:    viper.GetString("notification-url"),
+		APIEnabled:         viper.GetBool("api-enabled"),
+		APIPort:            viper.GetInt("api-port"),
+		APIToken:           viper.GetString("api-token"),
+		MetricsEnabled:     viper.GetBool("metrics"),
+		LogLevel:           viper.GetString("log-level"),
+		LogFormat:          viper.GetString("log-format"),
+		TZ:                 os.Getenv("TZ"),
 	}
 
 	// Load secrets from files
