@@ -29,6 +29,9 @@ type Updater struct {
 	client docker.Client
 	config *config.Config
 
+	// Concurrency guard
+	runMu sync.Mutex
+
 	// Statistics
 	totalUpdated atomic.Int64
 	totalFailed  atomic.Int64
@@ -46,6 +49,12 @@ func New(client docker.Client, cfg *config.Config) *Updater {
 
 // Run executes an update cycle with concurrent container processing
 func (u *Updater) Run() error {
+	// Prevent concurrent update cycles
+	if !u.runMu.TryLock() {
+		return fmt.Errorf("update cycle already in progress")
+	}
+	defer u.runMu.Unlock()
+
 	ctx := context.Background()
 	startTime := time.Now()
 

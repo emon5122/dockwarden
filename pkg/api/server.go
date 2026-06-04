@@ -362,7 +362,8 @@ func (s *Server) handleContainerLogsAPI(c *gin.Context) {
 
 // handleMetrics returns Prometheus metrics
 func (s *Server) handleMetrics(c *gin.Context) {
-	var updaterStats, watcherStats map[string]interface{}
+	var updaterStats map[string]interface{}
+	var watcherStats map[string]interface{}
 
 	if s.updater != nil {
 		updaterStats = s.updater.GetStats()
@@ -372,7 +373,11 @@ func (s *Server) handleMetrics(c *gin.Context) {
 	}
 
 	ctx := context.Background()
-	containers, _ := s.client.ListContainers(ctx, docker.ListOptions{All: true})
+	containers, err := s.client.ListContainers(ctx, docker.ListOptions{All: true})
+	if err != nil {
+		c.String(http.StatusServiceUnavailable, fmt.Sprintf("Error listing containers: %s", err.Error()))
+		return
+	}
 
 	running := 0
 	unhealthy := 0
@@ -404,15 +409,23 @@ dockwarden_updates_total %d
 # HELP dockwarden_update_failures_total Total number of failed updates
 # TYPE dockwarden_update_failures_total counter
 dockwarden_update_failures_total %d
+
+# HELP dockwarden_containers_monitored Number of monitored containers
+# TYPE dockwarden_containers_monitored gauge
+dockwarden_containers_monitored %d
+
+# HELP dockwarden_containers_gave_up Number of containers given up on
+# TYPE dockwarden_containers_gave_up gauge
+dockwarden_containers_gave_up %d
 `,
 		len(containers),
 		running,
 		unhealthy,
 		getInt64(updaterStats, "total_updated"),
 		getInt64(updaterStats, "total_failed"),
+		getInt64(watcherStats, "monitored_containers"),
+		getInt64(watcherStats, "gave_up_containers"),
 	)
-
-	_ = watcherStats
 
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(metrics))
 }
@@ -423,9 +436,9 @@ func (s *Server) handleDashboard(c *gin.Context) {
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Status(http.StatusOK)
 	tmpl.Execute(c.Writer, gin.H{
-		"Version":  meta.Version,
-		"TZ":       s.config.TZ,
-		"HasAuth":  s.config.APIToken != "",
+		"Version": meta.Version,
+		"TZ":      s.config.TZ,
+		"HasAuth": s.config.APIToken != "",
 	})
 }
 
@@ -450,7 +463,11 @@ func (s *Server) handleUIContainers(c *gin.Context) {
 // handleUIStats returns HTMX fragment for stats
 func (s *Server) handleUIStats(c *gin.Context) {
 	ctx := context.Background()
-	containers, _ := s.client.ListContainers(ctx, docker.ListOptions{All: true})
+	containers, err := s.client.ListContainers(ctx, docker.ListOptions{All: true})
+	if err != nil {
+		c.String(http.StatusInternalServerError, `<div class="text-red-500">Error loading stats: %s</div>`, err.Error())
+		return
+	}
 
 	running := 0
 	unhealthy := 0
@@ -596,8 +613,14 @@ func getInt64(m map[string]interface{}, key string) int64 {
 	if m == nil {
 		return 0
 	}
-	if v, ok := m[key].(int64); ok {
+	switch v := m[key].(type) {
+	case int64:
 		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
 	}
-	return 0
 }

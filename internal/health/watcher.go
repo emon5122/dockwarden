@@ -137,7 +137,9 @@ func (w *Watcher) checkHealthConcurrently() {
 	}
 	w.statesMu.Unlock()
 
-	// Process containers concurrently using goroutines
+	// Process containers concurrently using goroutines (with semaphore to limit concurrency)
+	maxConcurrency := 10
+	semaphore := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
 	for _, ctr := range containers {
 		// Skip containers that don't want health watching
@@ -157,8 +159,10 @@ func (w *Watcher) checkHealthConcurrently() {
 
 		// Process each container in its own goroutine
 		wg.Add(1)
+		semaphore <- struct{}{}
 		go func(container docker.Container) {
 			defer wg.Done()
+			defer func() { <-semaphore }()
 			w.processContainer(ctx, container)
 		}(ctr)
 	}
