@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0](https://github.com/emon5122/dockwarden/compare/v1.1.3...v1.2.0) (2026-06-13)
+
+
+### Features
+
+* Add health monitoring configuration and enhance watcher logic ([4ea7353](https://github.com/emon5122/dockwarden/commit/4ea73533a788664a48219d1033d455ef07dcba21))
+* Enhance concurrency handling in health checks and updates, improve error handling in metrics ([e062ad6](https://github.com/emon5122/dockwarden/commit/e062ad6f427815fc02c0551ab2343b30b20cc4e5))
+
+
+### Bug Fixes
+
+* **deps:** update module github.com/moby/moby/client to v0.4.1 ([1e46a2a](https://github.com/emon5122/dockwarden/commit/1e46a2ae403d8c6e90017d97cc884437b1e12af4))
+
 ## [1.1.3](https://github.com/emon5122/dockwarden/compare/v1.1.2...v1.1.3) (2026-05-06)
 
 
