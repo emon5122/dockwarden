@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/emon5122/dockwarden/compare/v1.2.0...v1.2.1) (2026-06-19)
+
+
+### Bug Fixes
+
+* Refactor image environment and label handling in container recreation ([1a84fc6](https://github.com/emon5122/dockwarden/commit/1a84fc6f8509c4d92e0295263e627841ea139400))
+
 ## [1.2.0](https://github.com/emon5122/dockwarden/compare/v1.1.3...v1.2.0) (2026-06-13)
 
 
