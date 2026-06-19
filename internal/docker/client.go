@@ -185,7 +185,7 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 	containerName := strings.TrimPrefix(inspect.Name, "/")
 	oldImageID := inspect.Image
 	createConfig := cloneContainerConfig(inspect.Config)
-	c.refreshImageEnvDefaults(ctx, oldImageID, createConfig)
+	c.refreshImageConfigDefaults(ctx, oldImageID, createConfig)
 
 	log.Debugf("Recreating container %s with latest image", containerName)
 
@@ -357,7 +357,7 @@ func (c *dockerClient) CloneContainer(ctx context.Context, id string, newName st
 	}
 	inspect := inspectResult.Container
 	createConfig := cloneContainerConfig(inspect.Config)
-	c.refreshImageEnvDefaults(ctx, inspect.Image, createConfig)
+	c.refreshImageConfigDefaults(ctx, inspect.Image, createConfig)
 
 	log.Debugf("Cloning container %s as %s", strings.TrimPrefix(inspect.Name, "/"), newName)
 
@@ -452,24 +452,43 @@ func (c *dockerClient) CreateHelperContainer(ctx context.Context, image string, 
 	return createResult.ID, nil
 }
 
-func (c *dockerClient) refreshImageEnvDefaults(ctx context.Context, oldImageID string, config *container.Config) {
+// refreshImageConfigDefaults strips the environment variables and labels that the
+// container inherited verbatim from its OLD image. Docker's inspect merges an
+// image's baked-in ENV and LABELs with the user-supplied ones into a single flat
+// set, with no record of which came from where. If we recreate the container with
+// that merged set, the old image's defaults become pinned as explicit values, so
+// the daemon never lets the NEW image's updated defaults take effect — leaving the
+// container advertising a stale image version (e.g. org.opencontainers.image.version).
+// Removing the entries that exactly match the old image's defaults leaves only the
+// genuine runtime overrides, so the new image's defaults flow through on recreate.
+func (c *dockerClient) refreshImageConfigDefaults(ctx context.Context, oldImageID string, config *container.Config) {
 	if config == nil || oldImageID == "" {
 		return
 	}
 
 	inspect, err := c.api.ImageInspect(ctx, oldImageID)
 	if err != nil {
-		log.Debugf("Keeping existing container env: failed to inspect old image %s: %v", truncateID(oldImageID), err)
+		log.Debugf("Keeping existing container env/labels: failed to inspect old image %s: %v", truncateID(oldImageID), err)
 		return
 	}
-	if inspect.Config == nil || len(inspect.Config.Env) == 0 {
+	if inspect.Config == nil {
 		return
 	}
 
-	originalLen := len(config.Env)
-	config.Env = stripInheritedImageEnv(config.Env, inspect.Config.Env)
-	if removed := originalLen - len(config.Env); removed > 0 {
-		log.Debugf("Removed %d inherited image environment entries before recreate", removed)
+	if len(inspect.Config.Env) > 0 {
+		originalLen := len(config.Env)
+		config.Env = stripInheritedImageEnv(config.Env, inspect.Config.Env)
+		if removed := originalLen - len(config.Env); removed > 0 {
+			log.Debugf("Removed %d inherited image environment entries before recreate", removed)
+		}
+	}
+
+	if len(inspect.Config.Labels) > 0 {
+		originalLen := len(config.Labels)
+		config.Labels = stripInheritedImageLabels(config.Labels, inspect.Config.Labels)
+		if removed := originalLen - len(config.Labels); removed > 0 {
+			log.Debugf("Removed %d inherited image label entries before recreate", removed)
+		}
 	}
 }
 
@@ -509,6 +528,27 @@ func stripInheritedImageEnv(containerEnv []string, oldImageEnv []string) []strin
 		}
 
 		refreshed = append(refreshed, entry)
+	}
+
+	return refreshed
+}
+
+// stripInheritedImageLabels removes labels that the container inherited verbatim
+// from the old image's metadata. Whatever remains is a genuine runtime/compose
+// label, so the new image's labels (including version labels like
+// org.opencontainers.image.version) are applied on recreate instead of being
+// shadowed by the old image's frozen values.
+func stripInheritedImageLabels(containerLabels, oldImageLabels map[string]string) map[string]string {
+	if len(containerLabels) == 0 || len(oldImageLabels) == 0 {
+		return containerLabels
+	}
+
+	refreshed := make(map[string]string, len(containerLabels))
+	for key, value := range containerLabels {
+		if oldValue, inherited := oldImageLabels[key]; inherited && value == oldValue {
+			continue
+		}
+		refreshed[key] = value
 	}
 
 	return refreshed
