@@ -15,6 +15,7 @@ type Config struct {
 	// Observation settings for health monitoring
 	ObservationPeriod  time.Duration // duration to observe before taking action
 	UnhealthyThreshold int           // number of consecutive unhealthy checks before action
+	RestartWindow      time.Duration // rolling window over which restarts are counted
 	// Operation mode
 	Mode     string // full, update, watch, monitor
 	RunOnce  bool
@@ -104,6 +105,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	// Observation settings flags
 	flags.Duration("observation-period", 30*time.Second, "Duration to observe unhealthy container before action")
 	flags.Int("unhealthy-threshold", 3, "Consecutive unhealthy checks before taking action")
+	flags.Duration("restart-window", time.Hour, "Rolling window over which restarts are counted before giving up")
 
 	// Secrets
 	flags.String("registry-secret", "", "Path to registry authentication secret")
@@ -138,6 +140,7 @@ func Load(cmd *cobra.Command) (*Config, error) {
 	cfg := &Config{
 		ObservationPeriod:  viper.GetDuration("observation-period"),
 		UnhealthyThreshold: viper.GetInt("unhealthy-threshold"),
+		RestartWindow:      viper.GetDuration("restart-window"),
 		Mode:               viper.GetString("mode"),
 		RunOnce:            viper.GetBool("run-once"),
 		Interval:           viper.GetDuration("interval"),

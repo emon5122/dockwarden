@@ -12,15 +12,23 @@ import (
 )
 
 const (
-	// MaxRestartAttempts is the maximum number of restart attempts before giving up
+	// MaxRestartAttempts is the maximum number of restarts allowed within
+	// Config.RestartWindow before giving up.
 	MaxRestartAttempts = 5
 	// HealthCheckInterval is the interval between health checks
 	HealthCheckInterval = 10 * time.Second
+	// DefaultRestartWindow is used when Config.RestartWindow is unset.
+	DefaultRestartWindow = time.Hour
 )
 
 // containerState tracks the state of health monitoring for a container
 type containerState struct {
-	restartAttempts      int
+	// restarts holds the timestamps of restarts we initiated, pruned to the
+	// rolling window. It is deliberately NOT a consecutive-failure counter: a
+	// container that recovers briefly after each restart would reset such a
+	// counter forever and never trip the breaker, so a flapping container got
+	// restarted indefinitely and never notified. See docs/known-issues.md.
+	restarts             []time.Time
 	lastImageID          string
 	gaveUp               bool
 	lastSeenRunning      bool
@@ -28,6 +36,34 @@ type containerState struct {
 	observationStart     time.Time
 	observed             bool
 	mu                   sync.Mutex
+}
+
+// pruneRestarts drops restart timestamps that have fallen out of the window.
+// Callers must hold state.mu.
+func (s *containerState) pruneRestarts(now time.Time, window time.Duration) {
+	cutoff := now.Add(-window)
+	kept := s.restarts[:0]
+	for _, at := range s.restarts {
+		if at.After(cutoff) {
+			kept = append(kept, at)
+		}
+	}
+	s.restarts = kept
+}
+
+// restartCount returns how many restarts occurred within the window.
+// Callers must hold state.mu.
+func (s *containerState) restartCount(now time.Time, window time.Duration) int {
+	s.pruneRestarts(now, window)
+	return len(s.restarts)
+}
+
+// recordRestart registers a restart and returns the new in-window count.
+// Callers must hold state.mu.
+func (s *containerState) recordRestart(now time.Time, window time.Duration) int {
+	s.restarts = append(s.restarts, now)
+	s.pruneRestarts(now, window)
+	return len(s.restarts)
 }
 
 // Watcher monitors container health and takes action using Go's native concurrency
@@ -180,7 +216,7 @@ func (w *Watcher) processContainer(ctx context.Context, ctr docker.Container) {
 	// Check if container image has been updated (reset attempts if new version)
 	if state.lastImageID != "" && state.lastImageID != ctr.ImageID {
 		log.Infof("Container %s has new image, resetting health tracking", ctr.Name)
-		state.restartAttempts = 0
+		state.restarts = nil
 		state.gaveUp = false
 		state.lastSeenRunning = false
 	}
@@ -208,21 +244,34 @@ func (w *Watcher) processContainer(ctx context.Context, ctr docker.Container) {
 	if ctr.IsUnhealthy() {
 		w.handleUnhealthy(ctx, ctr, state)
 	} else if ctr.IsHealthy() {
-		// Reset attempts and observation counters if container is now healthy
-		if state.restartAttempts > 0 {
-			log.Infof("Container %s is now healthy after %d restart(s)", ctr.Name, state.restartAttempts)
-			state.restartAttempts = 0
+		// Clear the observation counters, but deliberately NOT the restart
+		// history: recovering after a restart is exactly what a flapping
+		// container does, and forgetting it here is what let one be restarted
+		// forever. The history ages out of the rolling window on its own.
+		if recent := state.restartCount(time.Now(), w.restartWindow()); recent > 0 {
+			log.Infof("Container %s is healthy (%d restart(s) within the last %s)", ctr.Name, recent, w.restartWindow())
 		}
 		state.consecutiveUnhealthy = 0
 		state.observed = false
 	}
 }
 
+// restartWindow returns the rolling window over which restarts are counted.
+func (w *Watcher) restartWindow() time.Duration {
+	if w.config.RestartWindow > 0 {
+		return w.config.RestartWindow
+	}
+	return DefaultRestartWindow
+}
+
 // handleUnhealthy handles an unhealthy container with retry logic
 func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, state *containerState) {
+	now := time.Now()
+	window := w.restartWindow()
+
 	// Increment consecutive unhealthy count
 	state.consecutiveUnhealthy++
-	log.Warnf("Container %s is unhealthy (check %d/%d, restart %d/%d)", ctr.Name, state.consecutiveUnhealthy, w.config.UnhealthyThreshold, state.restartAttempts+1, MaxRestartAttempts)
+	log.Warnf("Container %s is unhealthy (check %d/%d, restart %d/%d in %s)", ctr.Name, state.consecutiveUnhealthy, w.config.UnhealthyThreshold, state.restartCount(now, window)+1, MaxRestartAttempts, window)
 
 	// If we have not yet started observation, start timer
 	if !state.observed {
@@ -238,8 +287,8 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 		state.consecutiveUnhealthy = 0
 
 		// Proceed with existing restart/notify logic
-		if state.restartAttempts >= MaxRestartAttempts {
-			log.Errorf("Container %s: giving up after %d restart attempts. Will retry when new version is available.", ctr.Name, MaxRestartAttempts)
+		if state.restartCount(now, window) >= MaxRestartAttempts {
+			log.Errorf("Container %s: giving up after %d restarts within %s. Restarting is not fixing it — check whether it is overloaded rather than dead. Will retry when new version is available.", ctr.Name, MaxRestartAttempts, window)
 			state.gaveUp = true
 			if w.notifier != nil {
 				w.notifier.NotifyContainerGaveUp(ctr.Name, ctr.Image, MaxRestartAttempts)
@@ -249,11 +298,11 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 
 		switch w.config.HealthAction {
 		case "restart":
-			state.restartAttempts++
-			log.Infof("Restarting unhealthy container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
+			attempt := state.recordRestart(now, window)
+			log.Infof("Restarting unhealthy container %s (attempt %d/%d in %s)", ctr.Name, attempt, MaxRestartAttempts, window)
 
 			if w.notifier != nil {
-				w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
+				w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, attempt)
 			}
 
 			timeout := ctr.GetStopTimeout(w.config.StopTimeout)
@@ -264,10 +313,12 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 			}
 
 		case "notify":
-			state.restartAttempts++
-			log.Infof("Notifying about unhealthy container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
+			// Recorded in the same window so a flapping container stops
+			// generating notifications too, instead of alerting hourly forever.
+			attempt := state.recordRestart(now, window)
+			log.Infof("Notifying about unhealthy container %s (attempt %d/%d in %s)", ctr.Name, attempt, MaxRestartAttempts, window)
 			if w.notifier != nil {
-				w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
+				w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, attempt)
 			}
 
 		default:
@@ -280,10 +331,13 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 
 // handleCrashed handles a container that has stopped unexpectedly
 func (w *Watcher) handleCrashed(ctx context.Context, ctr docker.Container, state *containerState) {
-	log.Warnf("Container %s crashed/exited (attempt %d/%d)", ctr.Name, state.restartAttempts+1, MaxRestartAttempts)
+	now := time.Now()
+	window := w.restartWindow()
 
-	if state.restartAttempts >= MaxRestartAttempts {
-		log.Errorf("Container %s: giving up after %d restart attempts for crashed container. Will retry when new version is available.", ctr.Name, MaxRestartAttempts)
+	log.Warnf("Container %s crashed/exited (attempt %d/%d in %s)", ctr.Name, state.restartCount(now, window)+1, MaxRestartAttempts, window)
+
+	if state.restartCount(now, window) >= MaxRestartAttempts {
+		log.Errorf("Container %s: giving up after %d restarts within %s for crashed container. Will retry when new version is available.", ctr.Name, MaxRestartAttempts, window)
 		state.gaveUp = true
 		state.lastSeenRunning = false
 
@@ -293,14 +347,14 @@ func (w *Watcher) handleCrashed(ctx context.Context, ctr docker.Container, state
 		return
 	}
 
-	state.restartAttempts++
+	attempt := state.recordRestart(now, window)
 
 	if w.notifier != nil {
-		w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, state.restartAttempts)
+		w.notifier.NotifyContainerUnhealthy(ctr.Name, ctr.Image, attempt)
 	}
 
 	// If start fails, reset lastSeenRunning to avoid rapid retry loops
-	log.Infof("Starting crashed container %s (attempt %d/%d)", ctr.Name, state.restartAttempts, MaxRestartAttempts)
+	log.Infof("Starting crashed container %s (attempt %d/%d in %s)", ctr.Name, attempt, MaxRestartAttempts, window)
 	if err := w.client.StartContainer(ctx, ctr.ID); err != nil {
 		log.Errorf("Failed to start crashed container %s: %v", ctr.Name, err)
 		state.lastSeenRunning = false
@@ -316,7 +370,7 @@ func (w *Watcher) ResetContainer(containerID string) {
 
 	if state, ok := w.states[containerID]; ok {
 		state.mu.Lock()
-		state.restartAttempts = 0
+		state.restarts = nil
 		state.gaveUp = false
 		state.lastImageID = ""
 		state.lastSeenRunning = false

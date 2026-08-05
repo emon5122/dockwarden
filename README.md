@@ -170,6 +170,7 @@ Enable with `--api-enabled` flag or `DOCKWARDEN_API_ENABLED=true` environment va
 | [API Reference](docs/api.md) | REST API documentation |
 | [Metrics](docs/metrics.md) | Prometheus integration |
 | [Migration Guide](docs/migration.md) | Moving from Watchtower/Watchdog |
+| [Known Issues](docs/known-issues.md) | Open bugs and workarounds |
 
 ---
 
