@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.0](https://github.com/emon5122/dockwarden/compare/v1.2.3...v1.3.0) (2026-08-17)
+
+
+### Features
+
+* enhance container management and configuration options ([a259313](https://github.com/emon5122/dockwarden/commit/a25931303000752db7840dbbf004afb2fa3ae1b8))
+
+
+### Bug Fixes
+
+* **ci:** use codecov `files` input instead of ignored `file` input ([ee67be3](https://github.com/emon5122/dockwarden/commit/ee67be365ec85df6842b7482a8b35db63ea6576e))
+* **ci:** use codecov files input instead of ignored file input ([9d1d73a](https://github.com/emon5122/dockwarden/commit/9d1d73a69a4567744e7a7d9582f6399bcfee57b3))
+* **deps:** update module github.com/moby/moby/client to v0.5.1 ([5ac2840](https://github.com/emon5122/dockwarden/commit/5ac2840bb8e6bf3dc16b0aacd00255695b3eb16b))
+* **deps:** update module github.com/sirupsen/logrus to v1.10.0 ([54699a4](https://github.com/emon5122/dockwarden/commit/54699a443b15c5fa417a7e363b0c7fdd7333a542))
+
 ## [1.2.3](https://github.com/emon5122/dockwarden/compare/v1.2.2...v1.2.3) (2026-08-17)
 
 
