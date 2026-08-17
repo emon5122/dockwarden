@@ -59,16 +59,15 @@ type Config struct {
 	Schedule string
 
 	// Update settings
-	Cleanup         bool
-	NoRestart       bool
-	NoPull          bool
-	MonitorOnly     bool
-	RollingRestart  bool
-	StopTimeout     time.Duration
-	LabelEnable     bool
-	LabelName       string
-	Scope           string
-	LabelPrecedence bool
+	Cleanup        bool
+	NoRestart      bool
+	NoPull         bool
+	MonitorOnly    bool
+	RollingRestart bool
+	StopTimeout    time.Duration
+	LabelEnable    bool
+	LabelName      string
+	Scope          string
 
 	// Container settings
 	IncludeStopped    bool
@@ -124,7 +123,9 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.Bool("label-enable", false, "Only manage containers with enable label")
 	flags.String("label-name", "dockwarden.enable", "Label to check for container management")
 	flags.String("scope", "", "Limit to containers with matching scope label")
-	flags.Bool("label-take-precedence", false, "Label values take precedence over arguments")
+	// Still registered so existing deployments that pass it don't fail to start.
+	flags.Bool("label-take-precedence", false, "Deprecated: container labels always take precedence")
+	_ = flags.MarkDeprecated("label-take-precedence", "container labels always take precedence in DockWarden")
 
 	// Container settings
 	flags.Bool("include-stopped", false, "Include stopped containers")
@@ -190,7 +191,6 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		LabelEnable:        viper.GetBool("label-enable"),
 		LabelName:          viper.GetString("label-name"),
 		Scope:              viper.GetString("scope"),
-		LabelPrecedence:    viper.GetBool("label-take-precedence"),
 		IncludeStopped:     viper.GetBool("include-stopped"),
 		IncludeRestarting:  viper.GetBool("include-restarting"),
 		ReviveStopped:      viper.GetBool("revive-stopped"),
@@ -208,6 +208,12 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		LogLevel:           viper.GetString("log-level"),
 		LogFormat:          viper.GetString("log-format"),
 		TZ:                 os.Getenv("TZ"),
+	}
+
+	// Cobra warns when the deprecated flag is passed on the command line, but
+	// not when it arrives via DOCKWARDEN_LABEL_TAKE_PRECEDENCE.
+	if viper.GetBool("label-take-precedence") {
+		logrus.Warn("label-take-precedence has no effect: container labels always take precedence in DockWarden")
 	}
 
 	// Load secrets from files

@@ -48,7 +48,11 @@ func (s *Scheduler) Stop() {
 
 // startCron starts cron-based scheduling
 func (s *Scheduler) startCron(fn func()) {
-	s.cron = cron.New(cron.WithSeconds())
+	// Accept standard 5-field cron expressions (as documented) as well as the
+	// 6-field with-seconds form. cron.WithSeconds() alone REQUIRES the seconds
+	// field, which made every 5-field expression a startup crash.
+	parser := cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
+	s.cron = cron.New(cron.WithParser(parser))
 
 	_, err := s.cron.AddFunc(s.config.Schedule, fn)
 	if err != nil {
@@ -64,8 +68,16 @@ func (s *Scheduler) startInterval(fn func()) {
 	// Run immediately on start
 	fn()
 
-	s.ticker = time.NewTicker(s.config.Interval)
-	log.Infof("Scheduled updates every %s", s.config.Interval)
+	interval := s.config.Interval
+	if interval <= 0 {
+		// time.NewTicker panics on non-positive durations, so a zero interval
+		// (unset, or an unparseable value that fell through to zero) must not
+		// reach it — fall back to the documented default instead of crashing.
+		log.Warnf("Invalid update interval %s; falling back to 1m", interval)
+		interval = time.Minute
+	}
+	s.ticker = time.NewTicker(interval)
+	log.Infof("Scheduled updates every %s", interval)
 
 	go func() {
 		for {

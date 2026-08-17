@@ -8,8 +8,14 @@ DockWarden supports per-container configuration using Docker labels.
 |-------|--------|---------|-------------|
 | `dockwarden.enable` | `true`/`false` | - | Enable/disable management |
 | `dockwarden.scope` | `<string>` | - | Scope identifier |
-| `dockwarden.stop-signal` | `SIGTERM`/`SIGKILL`/etc | `SIGTERM` | Stop signal |
-| `dockwarden.stop-timeout` | `<seconds>` | `10` | Stop timeout |
+| `dockwarden.stop-signal` | `SIGTERM`/`SIGQUIT`/etc | container's `STOPSIGNAL` (usually `SIGTERM`) | Stop signal |
+| `dockwarden.stop-timeout` | `<seconds>` or duration (`30s`, `1m`) | `10s` | Stop timeout |
+
+DockWarden also writes one label of its own to containers it recreates:
+`dockwarden.env-overrides` records which environment variables were genuine
+runtime overrides, so the next update can refresh image-provided defaults
+without touching your overrides. It is internal bookkeeping — don't set it
+yourself.
 
 ## Update Labels
 

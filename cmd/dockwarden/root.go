@@ -85,9 +85,8 @@ func preRun(cmd *cobra.Command, args []string) {
 
 	// Initialize Docker client
 	client, err = docker.NewClient(docker.ClientOptions{
-		IncludeStopped:    cfg.IncludeStopped,
-		IncludeRestarting: cfg.IncludeRestarting,
-		RemoveVolumes:     cfg.RemoveVolumes,
+		IncludeStopped: cfg.IncludeStopped,
+		RemoveVolumes:  cfg.RemoveVolumes,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create Docker client: %v", err)

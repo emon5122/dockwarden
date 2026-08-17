@@ -29,6 +29,7 @@ This document covers all configuration options for DockWarden.
 | `DOCKWARDEN_MONITOR_ONLY` | `false` | Monitor mode, no changes |
 | `DOCKWARDEN_ROLLING_RESTART` | `false` | Restart containers one at a time |
 | `DOCKWARDEN_STOP_TIMEOUT` | `10s` | Container stop timeout |
+| `DOCKWARDEN_REVIVE_STOPPED` | `false` | Start stopped containers after updating them |
 
 ### Container Selection
 
@@ -47,6 +48,9 @@ This document covers all configuration options for DockWarden.
 |----------|---------|-------------|
 | `DOCKWARDEN_HEALTH_WATCH` | `true` | Enable health monitoring |
 | `DOCKWARDEN_HEALTH_ACTION` | `restart` | Action on unhealthy: `restart`, `notify` |
+| `DOCKWARDEN_OBSERVATION_PERIOD` | `30s` | How long to observe an unhealthy container before acting |
+| `DOCKWARDEN_UNHEALTHY_THRESHOLD` | `3` | Consecutive unhealthy checks before acting |
+| `DOCKWARDEN_RESTART_WINDOW` | `1h` | Rolling window over which restarts are counted before giving up |
 
 ### Secrets (Docker Secrets Support)
 
@@ -76,6 +80,9 @@ This document covers all configuration options for DockWarden.
 | `TZ` | `Asia/Dhaka` | Timezone for logging |
 
 ## Cron Schedule Examples
+
+Standard 5-field cron expressions are supported; a 6-field form with a leading
+seconds field also works (e.g. `30 */5 * * * *` = every 5 minutes at :30).
 
 ```bash
 # Every 5 minutes

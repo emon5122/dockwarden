@@ -1,5 +1,50 @@
 # Known Issues
 
+## 2. Stale env pins survive recreation (image-default "pollution")
+
+**Status:** fixed (unreleased) · **Severity:** medium · **Component:**
+`internal/docker/client.go`
+
+### Summary
+
+Docker's container inspect merges the image's baked-in `ENV` with the
+user-supplied env into one flat list, with no record of which entry came from
+where. Recreating a container from that merged list pins the old image's
+defaults as explicit values, so the new image's updated defaults never take
+effect.
+
+Exact-match stripping (drop entries equal to the old image's defaults, added
+earlier for this problem) has a structural blind spot: an entry pinned by an
+*earlier* recreate — from an image two versions back, or by a DockWarden
+version that predates stripping — no longer matches the current image's
+default. It is then indistinguishable from a deliberate user override and
+sticks forever. Dropping it blindly is worse: a user override that happens to
+differ from the default (`NODE_ENV`, credentials, feature flags) would be
+silently reverted.
+
+### Fix: provenance
+
+Whenever DockWarden creates a container it now records the keys of the
+genuinely-overridden env entries in a `dockwarden.env-overrides` label. On the
+next recreate that label is authoritative: any env entry whose key is not
+listed came from *some* image and is dropped — no value comparison, no
+dependency on the old image still being inspectable. An empty label is
+meaningful ("zero overrides") and distinct from an absent one ("provenance
+unknown").
+
+### Remaining limitations (by design)
+
+- Containers without the label (created by compose/`docker run`, or last
+  recreated by an older DockWarden) still get the exact-match heuristic, so a
+  pre-existing stale pin survives until the container is recreated outside
+  DockWarden (compose rebuilds env from the compose file, which resets it).
+- A user override whose value exactly equals the old image's default is
+  indistinguishable from inheritance on that first, label-less recreate and
+  will be refreshed rather than pinned. From the second recreate on, the label
+  removes the ambiguity.
+- Labels have the same pollution mechanism and still use only exact-match
+  stripping; extending provenance to labels is possible but not yet done.
+
 ## 1. Restart breaker never trips for *flapping* containers
 
 **Status:** fixed (unreleased) · **Severity:** high · **Component:**

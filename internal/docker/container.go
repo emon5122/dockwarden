@@ -1,6 +1,12 @@
 package docker
 
-import "time"
+import (
+	"strconv"
+	"strings"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+)
 
 // Container represents a Docker container
 type Container struct {
@@ -18,6 +24,11 @@ type Container struct {
 // IsRunning returns true if the container is running
 func (c Container) IsRunning() bool {
 	return c.State == "running"
+}
+
+// IsRestarting returns true if the container is in the restarting state
+func (c Container) IsRestarting() bool {
+	return c.State == "restarting"
 }
 
 // IsHealthy returns true if the container is healthy
@@ -73,27 +84,36 @@ func (c Container) WatchEnabled() bool {
 	return label == "true"
 }
 
-// GetStopSignal returns the configured stop signal or default
+// GetStopSignal returns the stop signal from the dockwarden.stop-signal label,
+// or "" when unset. Empty means "let the daemon decide", which honours the
+// container's own STOPSIGNAL (from the image or create config) — returning a
+// hardcoded SIGTERM here would override images like nginx that declare SIGQUIT.
 func (c Container) GetStopSignal() string {
-	signal := c.GetLabel("dockwarden.stop-signal")
-	if signal == "" {
-		return "SIGTERM"
-	}
-	return signal
+	return c.GetLabel("dockwarden.stop-signal")
 }
 
-// GetStopTimeout returns the configured stop timeout or default
+// GetStopTimeout returns the configured stop timeout or default.
+//
+// The documented label form is a bare number of seconds ("60"), but a Go
+// duration ("30s", "1m") is also accepted. The bare form must be tried first:
+// naively appending "s" turned "1m" into "1ms" — a one-millisecond grace
+// period before SIGKILL — and turned "30s" into the unparseable "30ss",
+// silently discarding the label.
 func (c Container) GetStopTimeout(defaultTimeout time.Duration) time.Duration {
-	timeoutStr := c.GetLabel("dockwarden.stop-timeout")
-	if timeoutStr == "" {
+	raw := strings.TrimSpace(c.GetLabel("dockwarden.stop-timeout"))
+	if raw == "" {
 		return defaultTimeout
 	}
 
-	timeout, err := time.ParseDuration(timeoutStr + "s")
-	if err != nil {
-		return defaultTimeout
+	if seconds, err := strconv.ParseFloat(raw, 64); err == nil {
+		return time.Duration(seconds * float64(time.Second))
 	}
-	return timeout
+	if timeout, err := time.ParseDuration(raw); err == nil {
+		return timeout
+	}
+
+	log.Warnf("Container %s: unparseable dockwarden.stop-timeout %q, using default %s", c.Name, raw, defaultTimeout)
+	return defaultTimeout
 }
 
 // GetScope returns the scope label value

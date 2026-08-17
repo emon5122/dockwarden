@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,12 +23,12 @@ type Client interface {
 	Ping() error
 	ListContainers(ctx context.Context, opts ListOptions) ([]Container, error)
 	GetContainer(ctx context.Context, id string) (Container, error)
-	StopContainer(ctx context.Context, id string, timeout time.Duration) error
+	StopContainer(ctx context.Context, id string, timeout time.Duration, signal string) error
 	StartContainer(ctx context.Context, id string) error
-	RestartContainer(ctx context.Context, id string, timeout time.Duration) error
+	RestartContainer(ctx context.Context, id string, timeout time.Duration, signal string) error
 	RemoveContainer(ctx context.Context, id string) error
 	RenameContainer(ctx context.Context, id string, newName string) error
-	RecreateContainer(ctx context.Context, id string, timeout time.Duration) (string, error)
+	RecreateContainer(ctx context.Context, id string, timeout time.Duration, startStopped bool) (string, error)
 	PullImage(ctx context.Context, imageName string) error
 	GetImageDigest(ctx context.Context, imageName string) (string, error)
 	GetImageID(ctx context.Context, imageName string) (string, error)
@@ -41,9 +42,8 @@ type Client interface {
 
 // ClientOptions configures the Docker client
 type ClientOptions struct {
-	IncludeStopped    bool
-	IncludeRestarting bool
-	RemoveVolumes     bool
+	IncludeStopped bool
+	RemoveVolumes  bool
 }
 
 // ListOptions for filtering containers
@@ -112,11 +112,13 @@ func (c *dockerClient) GetContainer(ctx context.Context, id string) (Container, 
 	return containerFromInspect(result.Container), nil
 }
 
-// StopContainer stops a container
-func (c *dockerClient) StopContainer(ctx context.Context, id string, timeout time.Duration) error {
+// StopContainer stops a container. An empty signal lets the daemon use the
+// container's own STOPSIGNAL.
+func (c *dockerClient) StopContainer(ctx context.Context, id string, timeout time.Duration, signal string) error {
 	timeoutSec := int(timeout.Seconds())
 	if _, err := c.api.ContainerStop(ctx, id, dockerclient.ContainerStopOptions{
 		Timeout: &timeoutSec,
+		Signal:  signal,
 	}); err != nil {
 		return fmt.Errorf("failed to stop container %s: %w", id, err)
 	}
@@ -135,11 +137,13 @@ func (c *dockerClient) StartContainer(ctx context.Context, id string) error {
 	return nil
 }
 
-// RestartContainer restarts a container
-func (c *dockerClient) RestartContainer(ctx context.Context, id string, timeout time.Duration) error {
+// RestartContainer restarts a container. An empty signal lets the daemon use
+// the container's own STOPSIGNAL.
+func (c *dockerClient) RestartContainer(ctx context.Context, id string, timeout time.Duration, signal string) error {
 	timeoutSec := int(timeout.Seconds())
 	if _, err := c.api.ContainerRestart(ctx, id, dockerclient.ContainerRestartOptions{
 		Timeout: &timeoutSec,
+		Signal:  signal,
 	}); err != nil {
 		return fmt.Errorf("failed to restart container %s: %w", id, err)
 	}
@@ -173,8 +177,10 @@ func (c *dockerClient) RenameContainer(ctx context.Context, id string, newName s
 	return nil
 }
 
-// RecreateContainer stops, removes, and recreates a container with the latest image
-func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout time.Duration) (string, error) {
+// RecreateContainer stops, removes, and recreates a container with the latest
+// image. The new container is started only if the old one was running, or if
+// startStopped is true (revive-stopped semantics / explicit UI action).
+func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout time.Duration, startStopped bool) (string, error) {
 	// Get container config before removing
 	inspectResult, err := c.api.ContainerInspect(ctx, id, dockerclient.ContainerInspectOptions{})
 	if err != nil {
@@ -184,6 +190,7 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 
 	containerName := strings.TrimPrefix(inspect.Name, "/")
 	oldImageID := inspect.Image
+	wasRunning := inspect.State != nil && inspect.State.Running
 	createConfig := cloneContainerConfig(inspect.Config)
 	c.refreshImageConfigDefaults(ctx, oldImageID, createConfig)
 
@@ -209,11 +216,13 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 		}
 	}
 
-	// Stop container if running
-	if inspect.State.Running {
+	// Stop container if running, honouring the dockwarden.stop-signal label
+	// (empty signal = the container's own STOPSIGNAL).
+	if wasRunning {
 		timeoutSec := int(timeout.Seconds())
 		if _, err := c.api.ContainerStop(ctx, id, dockerclient.ContainerStopOptions{
 			Timeout: &timeoutSec,
+			Signal:  inspect.Config.Labels["dockwarden.stop-signal"],
 		}); err != nil {
 			return "", fmt.Errorf("failed to stop container %s: %w", id, err)
 		}
@@ -259,13 +268,17 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 		}
 	}
 
-	// Start the new container
-	if _, err := c.api.ContainerStart(ctx, newID, dockerclient.ContainerStartOptions{}); err != nil {
-		return "", fmt.Errorf("failed to start container %s: %w", containerName, err)
+	// Start the new container, preserving the stopped state of the old one
+	// unless the caller asked for a revive.
+	if wasRunning || startStopped {
+		if _, err := c.api.ContainerStart(ctx, newID, dockerclient.ContainerStartOptions{}); err != nil {
+			return "", fmt.Errorf("failed to start container %s: %w", containerName, err)
+		}
+		log.Infof("Started new container %s", containerName)
+	} else {
+		log.Infof("Recreated container %s (left stopped, as it was)", containerName)
 	}
-	log.Infof("Started new container %s", containerName)
 
-	_ = oldImageID
 	return newID, nil
 }
 
@@ -452,6 +465,12 @@ func (c *dockerClient) CreateHelperContainer(ctx context.Context, image string, 
 	return createResult.ID, nil
 }
 
+// envOverridesLabel records which env KEYS were genuine runtime overrides the
+// last time DockWarden created this container. It is DockWarden's own
+// bookkeeping label; an empty value is meaningful ("zero overrides") and is
+// distinct from the label being absent ("provenance unknown").
+const envOverridesLabel = "dockwarden.env-overrides"
+
 // refreshImageConfigDefaults strips the environment variables and labels that the
 // container inherited verbatim from its OLD image. Docker's inspect merges an
 // image's baked-in ENV and LABELs with the user-supplied ones into a single flat
@@ -459,37 +478,123 @@ func (c *dockerClient) CreateHelperContainer(ctx context.Context, image string, 
 // that merged set, the old image's defaults become pinned as explicit values, so
 // the daemon never lets the NEW image's updated defaults take effect — leaving the
 // container advertising a stale image version (e.g. org.opencontainers.image.version).
-// Removing the entries that exactly match the old image's defaults leaves only the
-// genuine runtime overrides, so the new image's defaults flow through on recreate.
+//
+// Exact-match stripping (drop entries equal to the old image's defaults) has a
+// blind spot: an entry pinned by an EARLIER recreate — from an image two or
+// more versions back, or by a DockWarden version that predates stripping — no
+// longer matches the current old image's default, so it is indistinguishable
+// from a deliberate user override and sticks forever. Dropping it blindly is
+// worse: a user override that happens to differ from the default (NODE_ENV,
+// credentials, feature flags) would be silently reverted.
+//
+// So DockWarden records provenance: whenever it creates a container it stores
+// the keys of the surviving (genuinely overridden) env entries in the
+// envOverridesLabel label. On the next recreate that label is authoritative —
+// every env entry whose key is not in it came from some image and is dropped,
+// with no value comparison and no dependency on the old image still being
+// inspectable. Containers created outside DockWarden (compose, docker run)
+// lack the label and get the exact-match heuristic; their compose-defined env
+// is rebuilt from scratch by compose anyway, which resets any pollution.
 func (c *dockerClient) refreshImageConfigDefaults(ctx context.Context, oldImageID string, config *container.Config) {
-	if config == nil || oldImageID == "" {
+	if config == nil {
 		return
 	}
 
-	inspect, err := c.api.ImageInspect(ctx, oldImageID)
-	if err != nil {
-		log.Debugf("Keeping existing container env/labels: failed to inspect old image %s: %v", truncateID(oldImageID), err)
-		return
-	}
-	if inspect.Config == nil {
-		return
-	}
+	overrides, hasProvenance := parseEnvOverrides(config.Labels)
 
-	if len(inspect.Config.Env) > 0 {
-		originalLen := len(config.Env)
-		config.Env = stripInheritedImageEnv(config.Env, inspect.Config.Env)
-		if removed := originalLen - len(config.Env); removed > 0 {
-			log.Debugf("Removed %d inherited image environment entries before recreate", removed)
+	var imageEnv []string
+	var imageLabels map[string]string
+	imageInspected := false
+	if oldImageID != "" {
+		if inspect, err := c.api.ImageInspect(ctx, oldImageID); err != nil {
+			log.Debugf("Failed to inspect old image %s: %v", truncateID(oldImageID), err)
+		} else if inspect.Config != nil {
+			imageEnv = inspect.Config.Env
+			imageLabels = inspect.Config.Labels
+			imageInspected = true
 		}
 	}
 
-	if len(inspect.Config.Labels) > 0 {
+	originalLen := len(config.Env)
+	if hasProvenance {
+		config.Env = filterEnvByOverrides(config.Env, overrides)
+	} else if imageInspected {
+		config.Env = stripInheritedImageEnv(config.Env, imageEnv)
+	}
+	if removed := originalLen - len(config.Env); removed > 0 {
+		log.Debugf("Removed %d inherited image environment entries before recreate", removed)
+	}
+
+	if len(imageLabels) > 0 {
 		originalLen := len(config.Labels)
-		config.Labels = stripInheritedImageLabels(config.Labels, inspect.Config.Labels)
+		config.Labels = stripInheritedImageLabels(config.Labels, imageLabels)
 		if removed := originalLen - len(config.Labels); removed > 0 {
 			log.Debugf("Removed %d inherited image label entries before recreate", removed)
 		}
 	}
+
+	// Record provenance for the next recreate — but only when the surviving
+	// entries are known to be genuine overrides. Without the label AND without
+	// the old image, the merged set could not be separated, and labelling it
+	// would freeze image-inherited entries in as fake overrides.
+	if hasProvenance || imageInspected {
+		setEnvOverrides(config)
+	}
+}
+
+// parseEnvOverrides reads the envOverridesLabel. The second return reports
+// whether the label was present at all.
+func parseEnvOverrides(labels map[string]string) (map[string]struct{}, bool) {
+	raw, ok := labels[envOverridesLabel]
+	if !ok {
+		return nil, false
+	}
+	overrides := make(map[string]struct{})
+	for _, key := range strings.Split(raw, ",") {
+		if key = strings.TrimSpace(key); key != "" {
+			overrides[key] = struct{}{}
+		}
+	}
+	return overrides, true
+}
+
+// filterEnvByOverrides keeps only the env entries whose key is a recorded
+// override. Malformed entries (no "=") and keys containing "," (which cannot
+// round-trip through the comma-separated label) are conservatively kept —
+// dropping a real user override is worse than keeping a stale default.
+func filterEnvByOverrides(env []string, overrides map[string]struct{}) []string {
+	if len(env) == 0 {
+		return env
+	}
+	kept := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, ok := splitEnv(entry)
+		if !ok || strings.Contains(key, ",") {
+			kept = append(kept, entry)
+			continue
+		}
+		if _, isOverride := overrides[key]; isOverride {
+			kept = append(kept, entry)
+		}
+	}
+	return kept
+}
+
+// setEnvOverrides stores the keys of config.Env — by this point exactly the
+// genuine overrides — in the envOverridesLabel. Always written, even when
+// empty: "no overrides" is information the next recreate needs.
+func setEnvOverrides(config *container.Config) {
+	keys := make([]string, 0, len(config.Env))
+	for _, entry := range config.Env {
+		if key, _, ok := splitEnv(entry); ok && !strings.Contains(key, ",") {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	if config.Labels == nil {
+		config.Labels = make(map[string]string, 1)
+	}
+	config.Labels[envOverridesLabel] = strings.Join(keys, ",")
 }
 
 func cloneContainerConfig(config *container.Config) *container.Config {

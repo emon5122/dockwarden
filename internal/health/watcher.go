@@ -306,7 +306,7 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 			}
 
 			timeout := ctr.GetStopTimeout(w.config.StopTimeout)
-			if err := w.client.RestartContainer(ctx, ctr.ID, timeout); err != nil {
+			if err := w.client.RestartContainer(ctx, ctr.ID, timeout, ctr.GetStopSignal()); err != nil {
 				log.Errorf("Failed to restart unhealthy container %s: %v", ctr.Name, err)
 			} else {
 				log.Infof("Restart initiated for container %s", ctr.Name)

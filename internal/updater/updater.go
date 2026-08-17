@@ -202,6 +202,11 @@ func (u *Updater) handleSelfUpdate(ctx context.Context, self docker.Container) {
 		return
 	}
 
+	if u.config.NoRestart {
+		log.Infof("DockWarden update pulled (%s -> %s); self-restart skipped (no-restart mode)", truncateID(currentImageID), truncateID(newImageID))
+		return
+	}
+
 	log.Infof("DockWarden update available (%s -> %s)! Performing self-update...", truncateID(currentImageID), truncateID(newImageID))
 
 	// Self-update strategy: we CANNOT stop ourselves first (that kills our process).
@@ -350,6 +355,11 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container) Up
 		return result
 	}
 
+	if u.config.NoRestart {
+		log.Infof("Update pulled for %s; container left running on old image (no-restart mode)", ctr.Name)
+		return result
+	}
+
 	if err := u.updateContainer(ctx, ctr); err != nil {
 		result.Error = fmt.Errorf("failed to update: %w", err)
 		return result
@@ -392,9 +402,16 @@ containerLoop:
 			}
 		}
 
-		// Only running containers (unless configured otherwise)
-		if !ctr.IsRunning() && !u.config.IncludeStopped {
-			continue
+		// Only running containers unless configured otherwise: restarting
+		// containers need include-restarting, stopped ones include-stopped.
+		if !ctr.IsRunning() {
+			if ctr.IsRestarting() {
+				if !u.config.IncludeRestarting {
+					continue
+				}
+			} else if !u.config.IncludeStopped {
+				continue
+			}
 		}
 
 		filtered = append(filtered, ctr)
@@ -445,7 +462,7 @@ func (u *Updater) updateContainer(ctx context.Context, ctr docker.Container) err
 
 	log.Infof("Updating container %s", ctr.Name)
 
-	_, err := u.client.RecreateContainer(ctx, ctr.ID, timeout)
+	_, err := u.client.RecreateContainer(ctx, ctr.ID, timeout, u.config.ReviveStopped)
 	if err != nil {
 		return fmt.Errorf("failed to recreate container: %w", err)
 	}
@@ -493,25 +510,6 @@ func truncateID(id string) string {
 // check for updates, since any tag could have been re-pushed.
 func isDigestPinned(imageName string) bool {
 	return strings.Contains(imageName, "@sha256:")
-}
-
-// extractTag extracts the tag from an image name
-func extractTag(imageName string) string {
-	if idx := strings.Index(imageName, "@"); idx != -1 {
-		imageName = imageName[:idx]
-	}
-
-	lastColon := strings.LastIndex(imageName, ":")
-	if lastColon == -1 {
-		return ""
-	}
-
-	afterColon := imageName[lastColon+1:]
-	if strings.Contains(afterColon, "/") {
-		return ""
-	}
-
-	return afterColon
 }
 
 // isSelfContainer checks if a container is the dockwarden container itself.

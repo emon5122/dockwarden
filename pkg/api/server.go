@@ -307,7 +307,7 @@ func (s *Server) handleRestartContainer(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	if err := s.client.RestartContainer(ctx, id, s.config.StopTimeout); err != nil {
+	if err := s.client.RestartContainer(ctx, id, s.config.StopTimeout, ""); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -320,7 +320,7 @@ func (s *Server) handleStopContainer(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	if err := s.client.StopContainer(ctx, id, s.config.StopTimeout); err != nil {
+	if err := s.client.StopContainer(ctx, id, s.config.StopTimeout, ""); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -333,7 +333,8 @@ func (s *Server) handleRecreateContainer(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	newID, err := s.client.RecreateContainer(ctx, id, s.config.StopTimeout)
+	// An explicit recreate request starts the container even if it was stopped.
+	newID, err := s.client.RecreateContainer(ctx, id, s.config.StopTimeout, true)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -517,7 +518,7 @@ func (s *Server) handleUIRestartContainer(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	if err := s.client.RestartContainer(ctx, id, s.config.StopTimeout); err != nil {
+	if err := s.client.RestartContainer(ctx, id, s.config.StopTimeout, ""); err != nil {
 		c.String(http.StatusOK, `<span class="text-red-500">Failed: %s</span>`, err.Error())
 		return
 	}
@@ -530,7 +531,7 @@ func (s *Server) handleUIStopContainer(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	if err := s.client.StopContainer(ctx, id, s.config.StopTimeout); err != nil {
+	if err := s.client.StopContainer(ctx, id, s.config.StopTimeout, ""); err != nil {
 		c.String(http.StatusOK, `<span class="text-red-500">Failed: %s</span>`, err.Error())
 		return
 	}
@@ -543,7 +544,7 @@ func (s *Server) handleUIRecreateContainer(c *gin.Context) {
 	id := c.Param("id")
 	ctx := context.Background()
 
-	if _, err := s.client.RecreateContainer(ctx, id, s.config.StopTimeout); err != nil {
+	if _, err := s.client.RecreateContainer(ctx, id, s.config.StopTimeout, true); err != nil {
 		c.String(http.StatusOK, `<span class="text-red-500">Failed: %s</span>`, err.Error())
 		return
 	}
