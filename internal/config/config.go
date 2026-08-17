@@ -2,13 +2,49 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
+
+// durationValue reads a duration setting, tolerating a value with no unit.
+//
+// viper delegates to spf13/cast, which appends "ns" to a duration string that
+// carries no unit. So a compose file saying DOCKWARDEN_INTERVAL: "60" does not
+// mean a minute — it means 60 *nanoseconds*, and the update loop spins
+// continuously instead of resting between passes. That shipped to real
+// deployments and was invisible except as permanent CPU load: every pass logged
+// "0 updated, 0 failed" and looked perfectly healthy. Nobody writing a bare
+// "60" means nanoseconds; they mean seconds.
+//
+// Interpreting it as seconds rather than rejecting it is deliberate. Existing
+// deployments already carry the unitless form, so erroring on startup would
+// turn a performance bug into a simultaneous outage across every box on the
+// next image pull. Warn loudly and keep running, so the config gets corrected
+// without anything breaking.
+//
+// This runs before logging is configured, so the warning uses logrus defaults.
+// That is intentional: a misconfiguration here should surface even when the
+// operator has raised the log level.
+func durationValue(key string) time.Duration {
+	raw := strings.TrimSpace(viper.GetString(key))
+	// Go duration units are ns, us/µs, ms, s, m, h — a bare number has none.
+	if raw != "" && !strings.ContainsAny(raw, "nsuµmh") {
+		if seconds, err := strconv.ParseFloat(raw, 64); err == nil {
+			d := time.Duration(seconds * float64(time.Second))
+			logrus.Warnf("%s=%q has no time unit; interpreting it as %s. "+
+				"Add a unit (e.g. %qs) — without one it would be read as nanoseconds.",
+				key, raw, d, raw)
+			return d
+		}
+	}
+	return viper.GetDuration(key)
+}
 
 // Config holds all configuration for DockWarden
 type Config struct {
@@ -138,19 +174,19 @@ func RegisterFlags(cmd *cobra.Command) {
 // Load loads configuration from flags, environment, and secrets
 func Load(cmd *cobra.Command) (*Config, error) {
 	cfg := &Config{
-		ObservationPeriod:  viper.GetDuration("observation-period"),
+		ObservationPeriod:  durationValue("observation-period"),
 		UnhealthyThreshold: viper.GetInt("unhealthy-threshold"),
-		RestartWindow:      viper.GetDuration("restart-window"),
+		RestartWindow:      durationValue("restart-window"),
 		Mode:               viper.GetString("mode"),
 		RunOnce:            viper.GetBool("run-once"),
-		Interval:           viper.GetDuration("interval"),
+		Interval:           durationValue("interval"),
 		Schedule:           viper.GetString("schedule"),
 		Cleanup:            viper.GetBool("cleanup"),
 		NoRestart:          viper.GetBool("no-restart"),
 		NoPull:             viper.GetBool("no-pull"),
 		MonitorOnly:        viper.GetBool("monitor-only"),
 		RollingRestart:     viper.GetBool("rolling-restart"),
-		StopTimeout:        viper.GetDuration("stop-timeout"),
+		StopTimeout:        durationValue("stop-timeout"),
 		LabelEnable:        viper.GetBool("label-enable"),
 		LabelName:          viper.GetString("label-name"),
 		Scope:              viper.GetString("scope"),
