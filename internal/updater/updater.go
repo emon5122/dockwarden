@@ -98,8 +98,9 @@ func (u *Updater) Run() error {
 		return nil
 	}
 
-	// Process non-self containers concurrently
-	results := u.processContainersConcurrently(ctx, filtered)
+	// Process non-self containers concurrently. All containers of this pass
+	// share one pull cache, so each image ref is pulled exactly once.
+	results := u.processContainersConcurrently(ctx, filtered, newPullCache(u.client))
 
 	// Summarize results
 	var updated, failed int
@@ -290,7 +291,7 @@ func (u *Updater) selfRecreate(ctx context.Context, selfID, imageName string, ti
 }
 
 // processContainersConcurrently processes all containers using goroutines
-func (u *Updater) processContainersConcurrently(ctx context.Context, containers []docker.Container) []UpdateResult {
+func (u *Updater) processContainersConcurrently(ctx context.Context, containers []docker.Container, pulls *pullCache) []UpdateResult {
 	resultsChan := make(chan UpdateResult, len(containers))
 	var wg sync.WaitGroup
 
@@ -313,7 +314,7 @@ func (u *Updater) processContainersConcurrently(ctx context.Context, containers 
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
 
-			result := u.processContainer(ctx, container)
+			result := u.processContainer(ctx, container, pulls)
 			resultsChan <- result
 		}(ctr)
 	}
@@ -332,14 +333,14 @@ func (u *Updater) processContainersConcurrently(ctx context.Context, containers 
 }
 
 // processContainer processes a single container
-func (u *Updater) processContainer(ctx context.Context, ctr docker.Container) UpdateResult {
+func (u *Updater) processContainer(ctx context.Context, ctr docker.Container, pulls *pullCache) UpdateResult {
 	result := UpdateResult{
 		ContainerID:   ctr.ID,
 		ContainerName: ctr.Name,
 		OldImageID:    ctr.ImageID,
 	}
 
-	needsUpdate, err := u.checkForUpdate(ctx, ctr)
+	needsUpdate, err := u.checkForUpdate(ctx, ctr, pulls)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to check for updates: %w", err)
 		return result
@@ -420,39 +421,123 @@ containerLoop:
 	return filtered
 }
 
-// checkForUpdate checks if a container has an available update
-func (u *Updater) checkForUpdate(ctx context.Context, ctr docker.Container) (bool, error) {
+// checkForUpdate checks if a container has an available update.
+//
+// The pullable ref comes from inspect (.Config.Image), never from the container
+// list: once a tag moves to a newer image, Docker rewrites the list's Image
+// field to the bare id of the image the container still runs, and pulling
+// "sha256:..." fails with "pull access denied for sha256" on every pass.
+//
+// The container's running image id is then compared with the id the tag points
+// to after the pull. Comparing the tag before and after our own pull would miss
+// a tag that already moved (an earlier pass, a local build, or another
+// container on the same ref pulling first in this pass), leaving the container
+// on the old image forever.
+func (u *Updater) checkForUpdate(ctx context.Context, ctr docker.Container, pulls *pullCache) (bool, error) {
 	if u.config.NoPull {
 		return false, nil
 	}
 
+	imageRef, runningImageID, err := u.resolveImage(ctx, ctr)
+	if err != nil {
+		return false, err
+	}
+
 	// Only skip digest-pinned images (sha256 references that can never change)
 	// ALL tags including version tags should be pulled to check for updates
-	if isDigestPinned(ctr.Image) {
+	if isDigestPinned(imageRef) {
 		log.Debugf("Skipping pull for %s: image pinned by digest", ctr.Name)
 		return false, nil
 	}
 
-	currentDigest, err := u.client.GetImageDigest(ctx, ctr.Image)
+	// Created from a bare image id: there is no tag to follow.
+	if isImageID(imageRef) {
+		log.Debugf("Skipping %s: created from image id %s, no tag to pull", ctr.Name, truncateID(imageRef))
+		return false, nil
+	}
+
+	newImageID, err := pulls.pull(ctx, imageRef)
 	if err != nil {
-		return false, fmt.Errorf("failed to get current digest: %w", err)
+		return false, err
 	}
 
-	if err := u.client.PullImage(ctx, ctr.Image); err != nil {
-		return false, fmt.Errorf("failed to pull image: %w", err)
-	}
-
-	newDigest, err := u.client.GetImageDigest(ctx, ctr.Image)
-	if err != nil {
-		return false, fmt.Errorf("failed to get new digest: %w", err)
-	}
-
-	if currentDigest != newDigest {
-		log.Debugf("Container %s has update: %s -> %s", ctr.Name, truncateID(currentDigest), truncateID(newDigest))
+	if runningImageID != newImageID {
+		log.Debugf("Container %s has update (%s): %s -> %s", ctr.Name, imageRef, truncateID(runningImageID), truncateID(newImageID))
 		return true, nil
 	}
 
 	return false, nil
+}
+
+// resolveImage returns the container's pullable image ref (.Config.Image) and
+// the id of the image it is running (.Image), both from inspect.
+func (u *Updater) resolveImage(ctx context.Context, ctr docker.Container) (string, string, error) {
+	inspected, err := u.client.GetContainer(ctx, ctr.ID)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	imageRef := inspected.Image
+	if imageRef == "" && !isImageID(ctr.Image) {
+		imageRef = ctr.Image
+	}
+
+	runningImageID := inspected.ImageID
+	if runningImageID == "" {
+		runningImageID = ctr.ImageID
+	}
+	if runningImageID == "" {
+		return "", "", fmt.Errorf("cannot determine running image id")
+	}
+
+	return imageRef, runningImageID, nil
+}
+
+// pullCache pulls each image ref at most once per update pass and remembers the
+// image id the ref resolved to, so every container sharing a repo:tag is
+// compared against the same freshly pulled image.
+type pullCache struct {
+	client docker.Client
+
+	mu      sync.Mutex
+	entries map[string]*pullEntry
+}
+
+type pullEntry struct {
+	once    sync.Once
+	imageID string
+	err     error
+}
+
+func newPullCache(client docker.Client) *pullCache {
+	return &pullCache{client: client, entries: make(map[string]*pullEntry)}
+}
+
+// pull pulls imageRef (once per pass) and returns the image id the ref points
+// to afterwards. Concurrent callers for the same ref wait for the one pull.
+func (p *pullCache) pull(ctx context.Context, imageRef string) (string, error) {
+	p.mu.Lock()
+	entry, ok := p.entries[imageRef]
+	if !ok {
+		entry = &pullEntry{}
+		p.entries[imageRef] = entry
+	}
+	p.mu.Unlock()
+
+	entry.once.Do(func() {
+		if err := p.client.PullImage(ctx, imageRef); err != nil {
+			entry.err = fmt.Errorf("failed to pull image: %w", err)
+			return
+		}
+		id, err := p.client.GetImageID(ctx, imageRef)
+		if err != nil {
+			entry.err = fmt.Errorf("failed to get new image id: %w", err)
+			return
+		}
+		entry.imageID = id
+	})
+
+	return entry.imageID, entry.err
 }
 
 // updateContainer updates a container to the new image
@@ -510,6 +595,24 @@ func truncateID(id string) string {
 // check for updates, since any tag could have been re-pushed.
 func isDigestPinned(imageName string) bool {
 	return strings.Contains(imageName, "@sha256:")
+}
+
+// isImageID reports whether ref is a bare image id ("sha256:<hex>" or a full
+// 64-char hex id, which Docker never accepts as a repo name) rather than a
+// pullable repo[:tag] reference.
+func isImageID(ref string) bool {
+	if strings.HasPrefix(ref, "sha256:") {
+		return true
+	}
+	if len(ref) != 64 {
+		return false
+	}
+	for _, r := range ref {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // isSelfContainer checks if a container is the dockwarden container itself.

@@ -2,6 +2,9 @@ package updater
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -10,68 +13,132 @@ import (
 	"github.com/emon5122/dockwarden/internal/docker"
 )
 
-// stubClient implements the parts of docker.Client the update cycle touches.
-// The embedded interface makes any un-stubbed call panic, which is the desired
+// stubClient models just enough of Docker for the update cycle: local tags
+// (ref -> image id), the registry (ref -> image id a pull fetches) and the
+// containers (ref they were created from + the image id they run). The
+// embedded interface makes any un-stubbed call panic, which is the desired
 // failure mode in these tests.
 type stubClient struct {
 	docker.Client
 
-	mu          sync.Mutex
-	containers  []docker.Container
-	digestCalls map[string]int
-	pulled      []string
-	recreated   []string
-	startFlags  []bool
+	mu         sync.Mutex
+	containers []stubContainer
+	local      map[string]string // ref -> image id the local tag points to
+	registry   map[string]string // ref -> image id a pull fetches
+	pulled     []string
+	recreated  []string
+	startFlags []bool
 }
 
+type stubContainer struct {
+	id, name string
+	ref      string // .Config.Image
+	imageID  string // .Image
+}
+
+// ListContainers mimics `docker ps`: once the container's tag points to a
+// different image, Docker reports the bare image id instead of the ref.
 func (s *stubClient) ListContainers(ctx context.Context, opts docker.ListOptions) ([]docker.Container, error) {
-	return s.containers, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]docker.Container, 0, len(s.containers))
+	for _, c := range s.containers {
+		image := c.ref
+		if s.local[c.ref] != c.imageID {
+			image = c.imageID
+		}
+		out = append(out, docker.Container{ID: c.id, Name: c.name, Image: image, ImageID: c.imageID, State: "running"})
+	}
+	return out, nil
 }
 
 func (s *stubClient) GetSelfContainerID() string { return "" }
 
-// GetImageDigest returns a different digest on the second call for the same
-// image, so every checked container reports an available update.
-func (s *stubClient) GetImageDigest(ctx context.Context, imageName string) (string, error) {
+func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Container, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.digestCalls == nil {
-		s.digestCalls = make(map[string]int)
+	for _, c := range s.containers {
+		if c.id == id {
+			return docker.Container{ID: c.id, Name: c.name, Image: c.ref, ImageID: c.imageID, State: "running"}, nil
+		}
 	}
-	s.digestCalls[imageName]++
-	if s.digestCalls[imageName] == 1 {
-		return "sha256:old", nil
-	}
-	return "sha256:new", nil
+	return docker.Container{}, fmt.Errorf("no such container %s", id)
 }
 
 func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pulled = append(s.pulled, imageName)
+	if strings.HasPrefix(imageName, "sha256:") {
+		return fmt.Errorf("failed to pull image %s: pull access denied for sha256", imageName)
+	}
+	if id, ok := s.registry[imageName]; ok {
+		s.local[imageName] = id
+	}
 	return nil
 }
 
+func (s *stubClient) GetImageID(ctx context.Context, imageName string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.local[imageName]
+	if !ok {
+		return "", fmt.Errorf("no such image %s", imageName)
+	}
+	return id, nil
+}
+
+// RecreateContainer recreates from .Config.Image, so the new container runs
+// whatever the local tag points to now.
 func (s *stubClient) RecreateContainer(ctx context.Context, id string, timeout time.Duration, startStopped bool) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.recreated = append(s.recreated, id)
 	s.startFlags = append(s.startFlags, startStopped)
-	return "new-" + id, nil
+	for i, c := range s.containers {
+		if c.id == id {
+			s.containers[i].imageID = s.local[c.ref]
+		}
+	}
+	return id, nil
 }
 
-func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Container, error) {
-	return docker.Container{ID: id}, nil
+// newStub returns a client whose containers run sha256:old (unless set) from
+// their own ref, with the registry holding sha256:new for each ref.
+func newStub(containers ...stubContainer) *stubClient {
+	s := &stubClient{local: map[string]string{}, registry: map[string]string{}}
+	for _, c := range containers {
+		if c.imageID == "" {
+			c.imageID = "sha256:old"
+		}
+		if _, ok := s.local[c.ref]; !ok {
+			s.local[c.ref] = c.imageID
+		}
+		s.registry[c.ref] = "sha256:new"
+		s.containers = append(s.containers, c)
+	}
+	return s
 }
 
-func runningContainer(id, name string) docker.Container {
-	return docker.Container{ID: id, Name: name, Image: "example/" + name + ":latest", State: "running"}
+func (s *stubClient) imageOf(id string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.containers {
+		if c.id == id {
+			return c.imageID
+		}
+	}
+	return ""
+}
+
+func runningContainer(id, name string) stubContainer {
+	return stubContainer{id: id, name: name, ref: "example/" + name + ":latest"}
 }
 
 // Regression: --no-restart was accepted and silently ignored, so containers
 // were recreated anyway. It must pull the image but leave the container alone.
 func TestRunNoRestartPullsButDoesNotRecreate(t *testing.T) {
-	client := &stubClient{containers: []docker.Container{runningContainer("c1", "web")}}
+	client := newStub(runningContainer("c1", "web"))
 	u := New(client, &config.Config{NoRestart: true})
 
 	if err := u.Run(); err != nil {
@@ -87,7 +154,7 @@ func TestRunNoRestartPullsButDoesNotRecreate(t *testing.T) {
 }
 
 func TestRunUpdatesAndPassesReviveStopped(t *testing.T) {
-	client := &stubClient{containers: []docker.Container{runningContainer("c1", "web")}}
+	client := newStub(runningContainer("c1", "web"))
 	u := New(client, &config.Config{ReviveStopped: true})
 
 	if err := u.Run(); err != nil {
@@ -99,6 +166,119 @@ func TestRunUpdatesAndPassesReviveStopped(t *testing.T) {
 	}
 	if len(client.startFlags) != 1 || !client.startFlags[0] {
 		t.Fatalf("startStopped flags = %v, want [true]", client.startFlags)
+	}
+}
+
+// Regression (1.2.3, home-pbx camgw/backend): two containers on one repo:tag,
+// the tag moves to a new image, one pass -> both are recreated, and the ref is
+// pulled once. Before, each container compared the tag before and after its
+// own pull; the second one's "before" was read after the first container's
+// pull had already moved the tag, so it was skipped.
+func TestRunUpdatesAllContainersSharingATag(t *testing.T) {
+	client := newStub(
+		stubContainer{id: "c1", name: "camgw-door", ref: "ghcr.io/x/camgw:latest"},
+		stubContainer{id: "c2", name: "camgw", ref: "ghcr.io/x/camgw:latest"},
+	)
+	u := New(client, &config.Config{})
+
+	if err := u.Run(); err != nil {
+		t.Fatalf("Run() = %v", err)
+	}
+
+	got := append([]string(nil), client.recreated...)
+	sort.Strings(got)
+	if len(got) != 2 || got[0] != "c1" || got[1] != "c2" {
+		t.Fatalf("recreated = %v, want [c1 c2]", got)
+	}
+	for _, id := range []string{"c1", "c2"} {
+		if img := client.imageOf(id); img != "sha256:new" {
+			t.Fatalf("%s runs %s, want sha256:new", id, img)
+		}
+	}
+	if len(client.pulled) != 1 || client.pulled[0] != "ghcr.io/x/camgw:latest" {
+		t.Fatalf("pulled = %v, want one pull of ghcr.io/x/camgw:latest", client.pulled)
+	}
+	if n := u.totalFailed.Load(); n != 0 {
+		t.Fatalf("failed = %d, want 0", n)
+	}
+}
+
+// Regression (1.2.3): the tag had already moved before the pass (an earlier
+// pass updated a sibling), so `docker ps` lists the container's image as a bare
+// sha256 id. DockWarden pulled "sha256:..." and failed every pass with "pull
+// access denied for sha256". It must pull the .Config.Image ref instead and
+// roll the container to the image the tag points to.
+func TestRunRollsContainerWhoseListImageIsAnID(t *testing.T) {
+	client := newStub(stubContainer{id: "c1", name: "backend", ref: "ghcr.io/x/backend:latest"})
+	// The tag already points to the new image locally; the container lags.
+	client.local["ghcr.io/x/backend:latest"] = "sha256:new"
+
+	listed, _ := client.ListContainers(context.Background(), docker.ListOptions{})
+	if listed[0].Image != "sha256:old" {
+		t.Fatalf("stub precondition: list Image = %q, want the bare id", listed[0].Image)
+	}
+
+	u := New(client, &config.Config{})
+	if err := u.Run(); err != nil {
+		t.Fatalf("Run() = %v", err)
+	}
+
+	for _, ref := range client.pulled {
+		if strings.HasPrefix(ref, "sha256:") {
+			t.Fatalf("pulled a bare image id: %v", client.pulled)
+		}
+	}
+	if n := u.totalFailed.Load(); n != 0 {
+		t.Fatalf("failed = %d, want 0", n)
+	}
+	if len(client.recreated) != 1 || client.recreated[0] != "c1" {
+		t.Fatalf("recreated = %v, want [c1]", client.recreated)
+	}
+	if img := client.imageOf("c1"); img != "sha256:new" {
+		t.Fatalf("c1 runs %s, want sha256:new", img)
+	}
+}
+
+// Up-to-date containers are left alone, and a container created from a bare
+// image id (nothing to follow) is skipped without an error or a pull.
+func TestRunLeavesUpToDateAndIDCreatedContainers(t *testing.T) {
+	const id64 = "9ebb91f2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	client := newStub(
+		stubContainer{id: "c1", name: "web", ref: "example/web:latest"},
+		stubContainer{id: "c2", name: "byid", ref: "sha256:" + id64, imageID: "sha256:" + id64},
+		stubContainer{id: "c3", name: "byhex", ref: id64, imageID: "sha256:" + id64},
+	)
+	client.registry["example/web:latest"] = "sha256:old" // nothing new upstream
+	u := New(client, &config.Config{})
+
+	if err := u.Run(); err != nil {
+		t.Fatalf("Run() = %v", err)
+	}
+	if len(client.recreated) != 0 {
+		t.Fatalf("recreated = %v, want none", client.recreated)
+	}
+	if n := u.totalFailed.Load(); n != 0 {
+		t.Fatalf("failed = %d, want 0", n)
+	}
+	if len(client.pulled) != 1 || client.pulled[0] != "example/web:latest" {
+		t.Fatalf("pulled = %v, want only example/web:latest", client.pulled)
+	}
+}
+
+func TestIsImageID(t *testing.T) {
+	const id64 = "9ebb91f2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cases := map[string]bool{
+		"sha256:" + id64:                         true,
+		id64:                                     true,
+		"9ebb91f2":                               false, // could be a repo name
+		"ghcr.io/nexisltd/home-pbx/camgw:latest": false,
+		"nginx":                                  false,
+		"nginx@sha256:" + id64:                   false, // digest-pinned ref, handled separately
+	}
+	for ref, want := range cases {
+		if got := isImageID(ref); got != want {
+			t.Errorf("isImageID(%q) = %v, want %v", ref, got, want)
+		}
 	}
 }
 
