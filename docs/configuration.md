@@ -38,7 +38,7 @@ This document covers all configuration options for DockWarden.
 | `DOCKWARDEN_LABEL_ENABLE` | `false` | Only manage labeled containers |
 | `DOCKWARDEN_LABEL_NAME` | `dockwarden.enable` | Label to check |
 | `DOCKWARDEN_SCOPE` | - | Limit to containers with matching scope |
-| `DOCKWARDEN_DISABLE_CONTAINERS` | - | Comma-separated list of containers to skip |
+| `DOCKWARDEN_DISABLE_CONTAINERS` | - | Containers to skip: space-separated in the env var (`a b`); the `--disable-containers` flag takes `a,b` |
 | `DOCKWARDEN_INCLUDE_STOPPED` | `false` | Include stopped containers |
 | `DOCKWARDEN_INCLUDE_RESTARTING` | `false` | Include restarting containers |
 
