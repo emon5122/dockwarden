@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.3](https://github.com/emon5122/dockwarden/compare/v1.4.2...v1.4.3) (2026-11-08)
+
+
+### Bug Fixes
+
+* self-update clones get their own hostname; fallback never picks the take-over helper ([647d429](https://github.com/emon5122/dockwarden/commit/647d429c974bf141318756a13dc75e144c3b36ee))
+
 ## [1.4.2](https://github.com/emon5122/dockwarden/compare/v1.4.1...v1.4.2) (2026-11-08)
 
 
