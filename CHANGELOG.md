@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.2](https://github.com/emon5122/dockwarden/compare/v1.4.1...v1.4.2) (2026-11-08)
+
+
+### Bug Fixes
+
+* never self-update through the generic path when the self container ID hint is wrong ([369728f](https://github.com/emon5122/dockwarden/commit/369728f0689d8e14bea917712b598758caa937c1))
+
 ## [1.4.1](https://github.com/emon5122/dockwarden/compare/v1.4.0...v1.4.1) (2026-11-08)
 
 
