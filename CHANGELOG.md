@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/emon5122/dockwarden/compare/v1.3.0...v1.4.0) (2026-11-08)
+
+
+### Features
+
+* per-container dockwarden.schedule window label ([42f9a7e](https://github.com/emon5122/dockwarden/commit/42f9a7eb9376c676a9d07558471c2c7285dca3ab))
+
 ## [1.3.0](https://github.com/emon5122/dockwarden/compare/v1.2.3...v1.3.0) (2026-11-07)
 
 
