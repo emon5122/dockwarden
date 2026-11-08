@@ -174,3 +174,32 @@ func TestSetEnvOverridesRoundTrips(t *testing.T) {
 		t.Fatalf("round-trip = %#v, want %#v", overrides, want)
 	}
 }
+
+// Regression (2026-11-08): a clone must not inherit Docker's default hostname (the source's short
+// ID), or a self-updated DockWarden reads the old ID as its own. A user-set hostname is kept.
+func TestCloneContainerConfigHostname(t *testing.T) {
+	src := "7af156267ba0c2fa0123456789abcdef0123456789abcdef0123456789abcdef"
+	if got := cloneContainerConfig(&container.Config{Hostname: "7af156267ba0"}, src).Hostname; got != "" {
+		t.Fatalf("default hostname must be cleared, got %q", got)
+	}
+	if got := cloneContainerConfig(&container.Config{Hostname: "ec9cd0151854"}, src).Hostname; got != "ec9cd0151854" {
+		t.Fatalf("a hostname that is not the source ID is user-set and kept, got %q", got)
+	}
+	if got := cloneContainerConfig(&container.Config{Hostname: "mail.example"}, src).Hostname; got != "mail.example" {
+		t.Fatalf("custom hostname kept, got %q", got)
+	}
+	if got := cloneContainerConfig(&container.Config{Hostname: "7af156267ba0"}, "").Hostname; got != "7af156267ba0" {
+		t.Fatalf("unknown source ID: keep as is, got %q", got)
+	}
+}
+
+func TestWithoutIDAlias(t *testing.T) {
+	src := "7af156267ba0c2fa0123456789abcdef0123456789abcdef0123456789abcdef"
+	got := withoutIDAlias([]string{"dockwarden", "7af156267ba0", src}, src)
+	if len(got) != 1 || got[0] != "dockwarden" {
+		t.Fatalf("got %v", got)
+	}
+	if got := withoutIDAlias(nil, src); got != nil {
+		t.Fatalf("nil stays nil, got %v", got)
+	}
+}

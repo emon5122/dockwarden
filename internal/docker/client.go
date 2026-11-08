@@ -191,7 +191,7 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 	containerName := strings.TrimPrefix(inspect.Name, "/")
 	oldImageID := inspect.Image
 	wasRunning := inspect.State != nil && inspect.State.Running
-	createConfig := cloneContainerConfig(inspect.Config)
+	createConfig := cloneContainerConfig(inspect.Config, inspect.ID)
 	c.refreshImageConfigDefaults(ctx, oldImageID, createConfig)
 
 	log.Debugf("Recreating container %s with latest image", containerName)
@@ -204,7 +204,7 @@ func (c *dockerClient) RecreateContainer(ctx context.Context, id string, timeout
 		for netName, netSettings := range inspect.NetworkSettings.Networks {
 			if netSettings != nil {
 				endpointConfig := &network.EndpointSettings{
-					Aliases:    netSettings.Aliases,
+					Aliases:    withoutIDAlias(netSettings.Aliases, inspect.ID),
 					Links:      netSettings.Links,
 					DriverOpts: netSettings.DriverOpts,
 					IPAMConfig: netSettings.IPAMConfig,
@@ -369,7 +369,7 @@ func (c *dockerClient) CloneContainer(ctx context.Context, id string, newName st
 		return "", fmt.Errorf("failed to inspect container %s: %w", id, err)
 	}
 	inspect := inspectResult.Container
-	createConfig := cloneContainerConfig(inspect.Config)
+	createConfig := cloneContainerConfig(inspect.Config, inspect.ID)
 	c.refreshImageConfigDefaults(ctx, inspect.Image, createConfig)
 
 	log.Debugf("Cloning container %s as %s", strings.TrimPrefix(inspect.Name, "/"), newName)
@@ -382,7 +382,7 @@ func (c *dockerClient) CloneContainer(ctx context.Context, id string, newName st
 		for netName, netSettings := range inspect.NetworkSettings.Networks {
 			if netSettings != nil {
 				networkingConfig.EndpointsConfig[netName] = &network.EndpointSettings{
-					Aliases:    netSettings.Aliases,
+					Aliases:    withoutIDAlias(netSettings.Aliases, inspect.ID),
 					Links:      netSettings.Links,
 					DriverOpts: netSettings.DriverOpts,
 					IPAMConfig: netSettings.IPAMConfig,
@@ -597,12 +597,21 @@ func setEnvOverrides(config *container.Config) {
 	config.Labels[envOverridesLabel] = strings.Join(keys, ",")
 }
 
-func cloneContainerConfig(config *container.Config) *container.Config {
+// cloneContainerConfig copies a container's config for a new container. sourceID is the
+// source container's ID: a Hostname equal to its 12-char short ID is Docker's default (not
+// user-set), so it is cleared and the new container gets its OWN ID as hostname. Copying it
+// made a self-updated DockWarden read the OLD container's ID as its own (hostname fallback of
+// GetSelfContainerID on cgroup v2), so on the next release it treated itself as an ordinary
+// container and stopped itself mid-update (2026-11-08, several hosts down).
+func cloneContainerConfig(config *container.Config, sourceID string) *container.Config {
 	if config == nil {
 		return &container.Config{}
 	}
 
 	clone := *config
+	if isDefaultHostname(config.Hostname, sourceID) {
+		clone.Hostname = ""
+	}
 	clone.Env = append([]string(nil), config.Env...)
 	if config.Labels != nil {
 		clone.Labels = make(map[string]string, len(config.Labels))
@@ -612,6 +621,27 @@ func cloneContainerConfig(config *container.Config) *container.Config {
 	}
 
 	return &clone
+}
+
+// isDefaultHostname reports whether hostname is Docker's default for the container sourceID
+// (its 12-char short ID) rather than a hostname the user set.
+func isDefaultHostname(hostname, sourceID string) bool {
+	return len(hostname) == 12 && len(sourceID) >= 12 && sourceID[:12] == hostname
+}
+
+// withoutIDAlias drops the source container's short-ID network alias (Docker adds it by
+// default); the new container gets its own.
+func withoutIDAlias(aliases []string, sourceID string) []string {
+	if len(aliases) == 0 || len(sourceID) < 12 {
+		return aliases
+	}
+	out := make([]string, 0, len(aliases))
+	for _, a := range aliases {
+		if a != sourceID[:12] && a != sourceID {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func stripInheritedImageEnv(containerEnv []string, oldImageEnv []string) []string {

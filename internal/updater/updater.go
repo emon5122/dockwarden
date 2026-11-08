@@ -663,8 +663,9 @@ func splitSelf(containers []docker.Container, selfID string) (*docker.Container,
 	}
 	if selfIdx < 0 {
 		for i, ctr := range containers {
-			// A renamed leftover (dockwarden-old) is never us for update purposes.
-			if isSelfContainer(ctr) && !strings.HasSuffix(ctr.Name, "-old") {
+			// A renamed leftover (dockwarden-old) or a self-update take-over helper
+			// (dockwarden-takeover-<ts>, same image) is never us for update purposes.
+			if isSelfContainer(ctr) && !strings.HasSuffix(ctr.Name, "-old") && !isTakeoverHelper(ctr) {
 				selfIdx = i
 				break
 			}
@@ -681,6 +682,13 @@ func splitSelf(containers []docker.Container, selfID string) (*docker.Container,
 		others = append(others, ctr)
 	}
 	return self, others
+}
+
+// isTakeoverHelper reports whether ctr is a self-update helper (CreateHelperContainer names
+// them dockwarden-takeover-<unix ts>). On 2026-11-08 the name fallback picked a just-finished
+// helper as "self" and logged "Self-update: failed to inspect self" with the helper's ID.
+func isTakeoverHelper(ctr docker.Container) bool {
+	return strings.Contains(strings.TrimPrefix(ctr.Name, "/"), "dockwarden-takeover-")
 }
 
 // isSelfContainer checks if a container is the dockwarden container itself.

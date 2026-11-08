@@ -431,3 +431,19 @@ func TestSplitSelf(t *testing.T) {
 		t.Fatalf("name fallback: %v %v", self, others)
 	}
 }
+
+// The self-update take-over helper shares the image and a "dockwarden" name; it must never be
+// picked as self by the fallback (2026-11-08, "failed to inspect self" with the helper's ID).
+func TestSplitSelfSkipsTakeoverHelper(t *testing.T) {
+	ctrs := []docker.Container{
+		{ID: "ae6a4aa3b145ffff", Name: "dockwarden-takeover-1762603987", Image: "emon5122/dockwarden:latest"},
+		{ID: "aeeceaf518c7ffff", Name: "dockwarden", Image: "emon5122/dockwarden:latest"},
+	}
+	self, others := splitSelf(ctrs, "8aac7488fd2c")
+	if self == nil || self.Name != "dockwarden" {
+		t.Fatalf("helper picked as self: %+v", self)
+	}
+	if len(others) != 1 || others[0].Name != "dockwarden-takeover-1762603987" {
+		t.Fatalf("others: %+v", others)
+	}
+}
