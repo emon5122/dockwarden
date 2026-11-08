@@ -77,21 +77,8 @@ func (u *Updater) Run() error {
 	// Separate self container from others using actual container ID
 	var selfContainer *docker.Container
 	var otherContainers []docker.Container
-
 	selfID := u.client.GetSelfContainerID()
-
-	for _, ctr := range containers {
-		if selfID != "" && strings.HasPrefix(ctr.ID, selfID) {
-			c := ctr
-			selfContainer = &c
-		} else if selfID == "" && isSelfContainer(ctr) {
-			// Fallback to name-based detection if we can't determine own ID
-			c := ctr
-			selfContainer = &c
-		} else {
-			otherContainers = append(otherContainers, ctr)
-		}
-	}
+	selfContainer, otherContainers = splitSelf(containers, selfID)
 
 	// Filter non-self containers
 	filtered := u.filterContainers(otherContainers)
@@ -162,10 +149,8 @@ func (u *Updater) handleSelfUpdate(ctx context.Context, self docker.Container) {
 
 	// Get the original image name from the container config, not the summary.
 	// When a tag is re-pushed, the summary's Image field becomes a raw sha256 digest.
-	selfID := u.client.GetSelfContainerID()
-	if selfID == "" {
-		selfID = self.ID
-	}
+	// self was resolved by splitSelf; its full ID beats the (possibly wrong) hint.
+	selfID := self.ID
 	inspected, err := u.client.GetContainer(ctx, selfID)
 	if err != nil {
 		log.Errorf("Self-update: failed to inspect self: %v", err)
@@ -655,6 +640,47 @@ func isImageID(ref string) bool {
 		}
 	}
 	return true
+}
+
+// splitSelf separates dockwarden's own container from the rest.
+//
+// The ID from GetSelfContainerID is only a hint (cgroup v2 hides it, and a
+// custom hostname or host networking can make the hostname fallback return a
+// string that is not our container ID). A non-empty but wrong ID used to match
+// nothing, so dockwarden fell into the ordinary-container path, stopped itself
+// and never started its replacement. So: match by ID first, and when that
+// finds nothing fall back to name/image/label detection. Without any match
+// self is nil and the caller never touches it.
+func splitSelf(containers []docker.Container, selfID string) (*docker.Container, []docker.Container) {
+	selfIdx := -1
+	if selfID != "" {
+		for i, ctr := range containers {
+			if strings.HasPrefix(ctr.ID, selfID) {
+				selfIdx = i
+				break
+			}
+		}
+	}
+	if selfIdx < 0 {
+		for i, ctr := range containers {
+			// A renamed leftover (dockwarden-old) is never us for update purposes.
+			if isSelfContainer(ctr) && !strings.HasSuffix(ctr.Name, "-old") {
+				selfIdx = i
+				break
+			}
+		}
+	}
+	others := make([]docker.Container, 0, len(containers))
+	var self *docker.Container
+	for i, ctr := range containers {
+		if i == selfIdx {
+			c := ctr
+			self = &c
+			continue
+		}
+		others = append(others, ctr)
+	}
+	return self, others
 }
 
 // isSelfContainer checks if a container is the dockwarden container itself.

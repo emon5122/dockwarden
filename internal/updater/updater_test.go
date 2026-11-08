@@ -28,6 +28,7 @@ type stubClient struct {
 	pulled     []string
 	recreated  []string
 	startFlags []bool
+	selfID     string
 }
 
 type stubContainer struct {
@@ -53,7 +54,7 @@ func (s *stubClient) ListContainers(ctx context.Context, opts docker.ListOptions
 	return out, nil
 }
 
-func (s *stubClient) GetSelfContainerID() string { return "" }
+func (s *stubClient) GetSelfContainerID() string { return s.selfID }
 
 func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Container, error) {
 	s.mu.Lock()
@@ -387,5 +388,46 @@ func TestScheduleWindowSelfUpdate(t *testing.T) {
 	}
 	if pulled(run(time.Date(2026, 11, 8, 3, 0, 0, 0, dhaka), "garbage")) {
 		t.Error("invalid spec did not fail closed for self-update")
+	}
+}
+
+// Regression (VPS 2026-11-08): a wrong, non-empty self ID matched no container,
+// so dockwarden updated itself as an ordinary container (stop -> SIGTERM, no
+// replacement ever started). It must be recognised by name instead and never
+// be recreated through the generic path.
+func TestWrongSelfIDNeverRecreatesSelf(t *testing.T) {
+	client := newStub(
+		stubContainer{id: "aaaaaaaaaaaa1111", name: "dockwarden", ref: "img/dockwarden:latest"},
+		stubContainer{id: "bbbbbbbbbbbb2222", name: "web", ref: "img/web:latest"},
+	)
+	client.selfID = "zzzzzzzzzzzz" // does not match any container
+	u := New(client, &config.Config{MonitorOnly: false})
+	func() {
+		defer func() { _ = recover() }() // self path hits un-stubbed helper calls; fine
+		_ = u.Run()
+	}()
+	for _, id := range client.recreated {
+		if id == "aaaaaaaaaaaa1111" {
+			t.Fatalf("dockwarden was recreated via the generic path: %v", client.recreated)
+		}
+	}
+	if len(client.recreated) != 1 || client.recreated[0] != "bbbbbbbbbbbb2222" {
+		t.Errorf("expected only web recreated, got %v", client.recreated)
+	}
+}
+
+func TestSplitSelf(t *testing.T) {
+	cs := []docker.Container{
+		{ID: "abc123def456aaaa", Name: "dockwarden"},
+		{ID: "ffff", Name: "dockwarden-old"},
+		{ID: "eeee", Name: "web", Image: "nginx"},
+	}
+	self, others := splitSelf(cs, "abc123def456")
+	if self == nil || self.Name != "dockwarden" || len(others) != 2 {
+		t.Fatalf("id match: %v %v", self, others)
+	}
+	self, others = splitSelf(cs, "wrongwrongwr")
+	if self == nil || self.Name != "dockwarden" || len(others) != 2 {
+		t.Fatalf("name fallback: %v %v", self, others)
 	}
 }
