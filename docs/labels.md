@@ -8,6 +8,7 @@ DockWarden supports per-container configuration using Docker labels.
 |-------|--------|---------|-------------|
 | `dockwarden.enable` | `true`/`false` | - | Enable/disable management |
 | `dockwarden.scope` | `<string>` | - | Scope identifier |
+| `dockwarden.schedule` | cron spec, optional `CRON_TZ=<zone>` prefix | - | Only check/update this container while the current minute matches the spec (see below) |
 | `dockwarden.stop-signal` | `SIGTERM`/`SIGQUIT`/etc | container's `STOPSIGNAL` (usually `SIGTERM`) | Stop signal |
 | `dockwarden.stop-timeout` | `<seconds>` or duration (`30s`, `1m`) | `10s` | Stop timeout |
 
@@ -134,3 +135,18 @@ services:
       - "dockwarden.enable=true"
       - "dockwarden.depends-on=database"
 ```
+
+
+## Per-container update window (`dockwarden.schedule`)
+
+The global pass (`DOCKWARDEN_SCHEDULE` / interval) still decides *when DockWarden looks*; this label decides *whether a given container may be touched in that pass*. The value uses the same cron syntax as `DOCKWARDEN_SCHEDULE` (5 or 6 fields) with an optional `CRON_TZ=<IANA zone>` prefix; without a prefix, DockWarden's own `TZ` applies. The container is checked/updated only if the current minute matches the spec; otherwise it is skipped with an `outside schedule window` log line. Containers without the label behave as before.
+
+```yaml
+labels:
+  # only recreate between 02:00 and 05:59 Dhaka time
+  - "dockwarden.schedule=CRON_TZ=Asia/Dhaka * * 2-5 * * *"
+```
+
+Run the global schedule at least once inside the window (e.g. every 10 minutes), otherwise the container never gets a pass. An invalid spec logs a warning on every pass and the container is **skipped** (fail closed). The label name can be changed with `--label-schedule` / `DOCKWARDEN_LABEL_SCHEDULE`.
+
+> `dockwarden.update.pre-hook` / `post-hook` are listed above but are not implemented in the current code, so they cannot veto an update; use `dockwarden.schedule` or `dockwarden.update.enable=false` instead.

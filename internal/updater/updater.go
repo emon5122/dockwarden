@@ -11,6 +11,7 @@ import (
 
 	"github.com/emon5122/dockwarden/internal/config"
 	"github.com/emon5122/dockwarden/internal/docker"
+	"github.com/emon5122/dockwarden/internal/scheduler"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -29,6 +30,9 @@ type Updater struct {
 	client docker.Client
 	config *config.Config
 
+	// now is the clock used for per-container schedule windows (tests override it)
+	now func() time.Time
+
 	// Concurrency guard
 	runMu sync.Mutex
 
@@ -44,6 +48,7 @@ func New(client docker.Client, cfg *config.Config) *Updater {
 	return &Updater{
 		client: client,
 		config: cfg,
+		now:    time.Now,
 	}
 }
 
@@ -403,6 +408,11 @@ containerLoop:
 			}
 		}
 
+		// Per-container update window (dockwarden.schedule label)
+		if !u.inScheduleWindow(ctr) {
+			continue
+		}
+
 		// Only running containers unless configured otherwise: restarting
 		// containers need include-restarting, stopped ones include-stopped.
 		if !ctr.IsRunning() {
@@ -419,6 +429,37 @@ containerLoop:
 	}
 
 	return filtered
+}
+
+// defaultScheduleLabel is the label holding a per-container update window.
+const defaultScheduleLabel = "dockwarden.schedule"
+
+// inScheduleWindow reports whether ctr may be checked/updated right now.
+// Containers without the schedule label always may. An invalid spec fails
+// closed: one warning, and the container is skipped for this pass.
+func (u *Updater) inScheduleWindow(ctr docker.Container) bool {
+	label := u.config.LabelSchedule
+	if label == "" {
+		label = defaultScheduleLabel
+	}
+	if !ctr.HasLabel(label) {
+		return true
+	}
+	spec := ctr.GetLabel(label)
+	now := time.Now
+	if u.now != nil {
+		now = u.now
+	}
+	ok, err := scheduler.InWindow(spec, now())
+	if err != nil {
+		log.Warnf("Skipping %s: label %s: %v (fail closed)", ctr.Name, label, err)
+		return false
+	}
+	if !ok {
+		log.Infof("Skipping %s: outside schedule window (%s)", ctr.Name, spec)
+		return false
+	}
+	return true
 }
 
 // checkForUpdate checks if a container has an available update.

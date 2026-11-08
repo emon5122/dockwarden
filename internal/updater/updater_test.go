@@ -34,6 +34,7 @@ type stubContainer struct {
 	id, name string
 	ref      string // .Config.Image
 	imageID  string // .Image
+	labels   map[string]string
 }
 
 // ListContainers mimics `docker ps`: once the container's tag points to a
@@ -47,7 +48,7 @@ func (s *stubClient) ListContainers(ctx context.Context, opts docker.ListOptions
 		if s.local[c.ref] != c.imageID {
 			image = c.imageID
 		}
-		out = append(out, docker.Container{ID: c.id, Name: c.name, Image: image, ImageID: c.imageID, State: "running"})
+		out = append(out, docker.Container{ID: c.id, Name: c.name, Image: image, ImageID: c.imageID, State: "running", Labels: c.labels})
 	}
 	return out, nil
 }
@@ -319,5 +320,45 @@ func TestFilterContainersStateFlags(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A container with dockwarden.schedule is only updated inside its window; an
+// unlabelled one is unaffected; an invalid spec fails closed.
+func TestScheduleWindowLabel(t *testing.T) {
+	const win = "CRON_TZ=Asia/Dhaka * * 2-5 * * *"
+	lbl := func(v string) map[string]string { return map[string]string{"dockwarden.schedule": v} }
+	run := func(now time.Time) *stubClient {
+		client := newStub(
+			stubContainer{id: "plain", name: "plain", ref: "img/plain:latest"},
+			stubContainer{id: "win", name: "win", ref: "img/win:latest", labels: lbl(win)},
+			stubContainer{id: "bad", name: "bad", ref: "img/bad:latest", labels: lbl("garbage")},
+		)
+		u := New(client, &config.Config{})
+		u.now = func() time.Time { return now }
+		if err := u.Run(); err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	dhaka := time.FixedZone("BDT", 6*3600)
+
+	out := run(time.Date(2026, 11, 8, 12, 0, 0, 0, dhaka))
+	if out.imageOf("plain") != "sha256:new" {
+		t.Errorf("unlabelled container not updated: %s", out.imageOf("plain"))
+	}
+	if out.imageOf("win") != "sha256:old" {
+		t.Errorf("labelled container updated outside its window")
+	}
+	if out.imageOf("bad") != "sha256:old" {
+		t.Errorf("invalid spec did not fail closed")
+	}
+
+	in := run(time.Date(2026, 11, 8, 3, 0, 0, 0, dhaka))
+	if in.imageOf("win") != "sha256:new" {
+		t.Errorf("labelled container not updated inside its window")
+	}
+	if in.imageOf("bad") != "sha256:old" {
+		t.Errorf("invalid spec did not fail closed inside window")
 	}
 }

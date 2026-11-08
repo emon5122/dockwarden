@@ -67,6 +67,7 @@ type Config struct {
 	StopTimeout    time.Duration
 	LabelEnable    bool
 	LabelName      string
+	LabelSchedule  string
 	Scope          string
 
 	// Container settings
@@ -122,6 +123,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.Duration("stop-timeout", 10*time.Second, "Container stop timeout")
 	flags.Bool("label-enable", false, "Only manage containers with enable label")
 	flags.String("label-name", "dockwarden.enable", "Label to check for container management")
+	flags.String("label-schedule", "dockwarden.schedule", "Container label holding a per-container update window (cron spec, optional CRON_TZ= prefix)")
 	flags.String("scope", "", "Limit to containers with matching scope label")
 	// Still registered so existing deployments that pass it don't fail to start.
 	flags.Bool("label-take-precedence", false, "Deprecated: container labels always take precedence")
@@ -190,6 +192,7 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		StopTimeout:        durationValue("stop-timeout"),
 		LabelEnable:        viper.GetBool("label-enable"),
 		LabelName:          viper.GetString("label-name"),
+		LabelSchedule:      viper.GetString("label-schedule"),
 		Scope:              viper.GetString("scope"),
 		IncludeStopped:     viper.GetBool("include-stopped"),
 		IncludeRestarting:  viper.GetBool("include-restarting"),

@@ -197,6 +197,7 @@ DockWarden comes with sensible defaults:
 | `DOCKWARDEN_SCHEDULE` | - | Cron expression (e.g., `0 0 4 * * *`) |
 | `DOCKWARDEN_CLEANUP` | `true` | Remove old images after update |
 | `DOCKWARDEN_LABEL_ENABLE` | `false` | Only manage labeled containers |
+| `DOCKWARDEN_LABEL_SCHEDULE` | `dockwarden.schedule` | Label name holding a per-container update window |
 | `DOCKWARDEN_HEALTH_WATCH` | `true` | Enable health monitoring |
 | `DOCKWARDEN_HEALTH_ACTION` | `restart` | Action on unhealthy: `restart` or `notify` |
 | `DOCKWARDEN_API_ENABLED` | `false` | Enable web UI and REST API |
@@ -216,7 +217,11 @@ labels:
   - "dockwarden.stop-signal=SIGTERM"
   - "dockwarden.stop-timeout=30"
   - "dockwarden.scope=production"
+  # only update inside this window (cron spec, optional CRON_TZ prefix)
+  - "dockwarden.schedule=CRON_TZ=Asia/Dhaka * * 2-5 * * *"
 ```
+
+Outside its window a container is skipped; an invalid spec is skipped too (fail closed). See [Container Labels](docs/labels.md#per-container-update-window-dockwardenschedule).
 
 See [full configuration documentation](docs/configuration.md) for all options.
 
