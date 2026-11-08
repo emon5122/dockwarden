@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/emon5122/dockwarden/compare/v1.4.0...v1.4.1) (2026-11-08)
+
+
+### Bug Fixes
+
+* dockwarden.schedule applies to self-update, reject [@every](https://github.com/every) ([219ab06](https://github.com/emon5122/dockwarden/commit/219ab060c6203acc1fc5417cdaa2e88122ce41c1))
+
 ## [1.4.0](https://github.com/emon5122/dockwarden/compare/v1.3.0...v1.4.0) (2026-11-08)
 
 
