@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.4](https://github.com/emon5122/dockwarden/compare/v1.4.3...v1.4.4) (2026-11-08)
+
+
+### Bug Fixes
+
+* **deps:** bump golang.org/x/crypto to v0.58.0, x/net to v0.62.0, x/text to v0.43.0, otel to v1.41.0; build on Go 1.26.10 ([3b7ae97](https://github.com/emon5122/dockwarden/commit/3b7ae9755260ea4121c55426e92e78e189b9af65))
+
 ## [1.4.3](https://github.com/emon5122/dockwarden/compare/v1.4.2...v1.4.3) (2026-11-08)
 
 
