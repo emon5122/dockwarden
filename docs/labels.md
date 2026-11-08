@@ -147,6 +147,6 @@ labels:
   - "dockwarden.schedule=CRON_TZ=Asia/Dhaka * * 2-5 * * *"
 ```
 
-Run the global schedule at least once inside the window (e.g. every 10 minutes), otherwise the container never gets a pass. An invalid spec logs a warning on every pass and the container is **skipped** (fail closed). The label name can be changed with `--label-schedule` / `DOCKWARDEN_LABEL_SCHEDULE`.
+Run the global schedule at least once inside the window (e.g. every 10 minutes), otherwise the container never gets a pass. An invalid spec logs a warning on every pass and the container is **skipped** (fail closed). `@every <duration>` descriptors are rejected (they are not wall-clock windows), also fail closed. The window also gates DockWarden's own self-update, and manual/API-triggered passes are window-gated too; a pass that runs past the window end is not interrupted. The label name can be changed with `--label-schedule` / `DOCKWARDEN_LABEL_SCHEDULE`.
 
 > `dockwarden.update.pre-hook` / `post-hook` are listed above but are not implemented in the current code, so they cannot veto an update; use `dockwarden.schedule` or `dockwarden.update.enable=false` instead.

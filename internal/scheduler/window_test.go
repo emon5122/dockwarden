@@ -45,7 +45,7 @@ func TestInWindow(t *testing.T) {
 }
 
 func TestInWindowInvalidFailsClosed(t *testing.T) {
-	for _, spec := range []string{"", "   ", "not a cron", "* * * *", "CRON_TZ=Mars/Base * * 2-5 * * *", "99 * * * *"} {
+	for _, spec := range []string{"", "   ", "not a cron", "* * * *", "CRON_TZ=Mars/Base * * 2-5 * * *", "99 * * * *", "@every 1h", "@every 30s", "CRON_TZ=Asia/Dhaka @every 1h"} {
 		ok, err := InWindow(spec, time.Now())
 		if err == nil || ok {
 			t.Errorf("spec %q: got (%v, %v), want (false, error)", spec, ok, err)

@@ -21,6 +21,17 @@ func InWindow(spec string, now time.Time) (bool, error) {
 	if spec == "" {
 		return false, fmt.Errorf("empty schedule spec")
 	}
+	// "@every <d>" is relative to when the parser ran, not a wall-clock
+	// window, so it can never describe one: reject (fail closed).
+	body := spec
+	if strings.HasPrefix(body, "CRON_TZ=") || strings.HasPrefix(body, "TZ=") {
+		if i := strings.IndexAny(body, " \t"); i >= 0 {
+			body = strings.TrimSpace(body[i:])
+		}
+	}
+	if strings.HasPrefix(body, "@every") {
+		return false, fmt.Errorf("invalid schedule spec %q: @every is not a time window", spec)
+	}
 	sched, err := windowParser.Parse(spec)
 	if err != nil {
 		return false, fmt.Errorf("invalid schedule spec %q: %w", spec, err)

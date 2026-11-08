@@ -134,7 +134,8 @@ func (u *Updater) Run() error {
 	}
 
 	// Self-update LAST - after all other containers are done
-	if selfContainer != nil && selfContainer.UpdateEnabled() {
+	// (dockwarden.schedule applies to it too; invalid spec fails closed)
+	if selfContainer != nil && selfContainer.UpdateEnabled() && u.inScheduleWindow(*selfContainer) {
 		u.handleSelfUpdate(ctx, *selfContainer)
 	}
 

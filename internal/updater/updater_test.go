@@ -362,3 +362,30 @@ func TestScheduleWindowLabel(t *testing.T) {
 		t.Errorf("invalid spec did not fail closed inside window")
 	}
 }
+
+// dockwarden.schedule also gates dockwarden's own self-update.
+func TestScheduleWindowSelfUpdate(t *testing.T) {
+	const win = "CRON_TZ=Asia/Dhaka * * 2-5 * * *"
+	dhaka := time.FixedZone("BDT", 6*3600)
+	run := func(now time.Time, spec string) *stubClient {
+		client := newStub(stubContainer{id: "self", name: "dockwarden", ref: "img/dockwarden:latest",
+			labels: map[string]string{"dockwarden.schedule": spec}})
+		u := New(client, &config.Config{NoRestart: true})
+		u.now = func() time.Time { return now }
+		if err := u.Run(); err != nil {
+			t.Fatal(err)
+		}
+		return client
+	}
+	pulled := func(c *stubClient) bool { return len(c.pulled) > 0 }
+
+	if pulled(run(time.Date(2026, 11, 8, 12, 0, 0, 0, dhaka), win)) {
+		t.Error("self-update ran outside its window")
+	}
+	if !pulled(run(time.Date(2026, 11, 8, 3, 0, 0, 0, dhaka), win)) {
+		t.Error("self-update did not run inside its window")
+	}
+	if pulled(run(time.Date(2026, 11, 8, 3, 0, 0, 0, dhaka), "garbage")) {
+		t.Error("invalid spec did not fail closed for self-update")
+	}
+}
