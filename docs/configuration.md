@@ -52,6 +52,14 @@ This document covers all configuration options for DockWarden.
 | `DOCKWARDEN_UNHEALTHY_THRESHOLD` | `3` | Consecutive unhealthy checks before acting |
 | `DOCKWARDEN_RESTART_WINDOW` | `1h` | Rolling window over which restarts are counted before giving up |
 
+A container that stops after it was seen running is started again only when it
+looks like a crash. It is left stopped when:
+
+- its restart policy is `no` (or unset), so `docker update --restart=no && docker stop` retires it;
+- it exited with 0 or by a stop signal (130, 131, 137, 143) and was not OOM-killed, i.e. `docker stop` / `docker kill`;
+- Docker is already restarting it, or it is paused;
+- it has the label `dockwarden.watch.enable=false`.
+
 ### Secrets (Docker Secrets Support)
 
 | Variable | Description |
