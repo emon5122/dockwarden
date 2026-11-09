@@ -12,6 +12,8 @@ permissions:
 jobs:
   trivy:
     uses: nexisltd/.github/.github/workflows/trivy.yml@main
+    with:
+      runs-on: '"ubuntu-latest"'
     permissions:
       contents: read
       security-events: write
