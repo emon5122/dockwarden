@@ -59,13 +59,19 @@ func (f *fakeClient) set(fn func(c *docker.Container)) {
 // then runs one more tick and returns the fake for assertions.
 func runThenStop(t *testing.T, ctr docker.Container, stop func(c *docker.Container)) *fakeClient {
 	t.Helper()
+	f, _ := runThenStopWatcher(t, ctr, stop)
+	return f
+}
+
+func runThenStopWatcher(t *testing.T, ctr docker.Container, stop func(c *docker.Container)) (*fakeClient, *Watcher) {
+	t.Helper()
 	ctr.ID, ctr.Name, ctr.ImageID, ctr.State = "c1", "svc", "sha256:img", "running"
 	f := &fakeClient{ctr: ctr}
 	w := NewWatcher(f, &config.Config{})
 	w.checkHealthConcurrently()
 	f.set(stop)
 	w.checkHealthConcurrently()
-	return f
+	return f, w
 }
 
 func stoppedWith(code int, oom bool) func(c *docker.Container) {
@@ -160,8 +166,13 @@ func TestInspectErrorDoesNotReviveAndRetries(t *testing.T) {
 
 // A deliberately stopped container that someone starts again is tracked again.
 func TestStoppedThenStartedAgainIsTrackedAgain(t *testing.T) {
-	f := runThenStop(t, docker.Container{RestartPolicy: "unless-stopped"}, stoppedWith(143, false))
-	w := NewWatcher(f, &config.Config{})
+	f, w := runThenStopWatcher(t, docker.Container{RestartPolicy: "unless-stopped"}, stoppedWith(143, false))
+	// Still stopped on later ticks: not inspected again, not started.
+	inspected := f.inspected
+	w.checkHealthConcurrently()
+	if f.inspected != inspected || len(f.started) != 0 {
+		t.Fatalf("deliberately stopped container re-evaluated: inspected %d->%d, started %d", inspected, f.inspected, len(f.started))
+	}
 	f.set(func(c *docker.Container) { c.State = "running" })
 	w.checkHealthConcurrently()
 	f.set(stoppedWith(2, false))
