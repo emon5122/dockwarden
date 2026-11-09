@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.5](https://github.com/emon5122/dockwarden/compare/v1.4.4...v1.4.5) (2026-11-09)
+
+
+### Bug Fixes
+
+* **health:** never revive containers that were stopped on purpose ([#58](https://github.com/emon5122/dockwarden/issues/58)) ([a3a55eb](https://github.com/emon5122/dockwarden/commit/a3a55eb91e7607e4c9ae072ff473d17a103009ae))
+
 ## [1.4.4](https://github.com/emon5122/dockwarden/compare/v1.4.3...v1.4.4) (2026-11-08)
 
 
