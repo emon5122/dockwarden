@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -230,8 +231,14 @@ func (w *Watcher) processContainer(ctx context.Context, ctr docker.Container) {
 
 	// Detect crashed/exited containers that were previously running
 	if !ctr.IsRunning() && state.lastSeenRunning {
-		log.Warnf("Container %s has stopped unexpectedly (state: %s)", ctr.Name, ctr.State)
-		w.handleCrashed(ctx, ctr, state)
+		// Docker's own restart policy is already bringing it back, or someone
+		// paused it on purpose: neither is ours to start. Keep lastSeenRunning
+		// so a container that ends up exited is still evaluated next tick.
+		if ctr.IsRestarting() || ctr.IsPaused() {
+			log.Debugf("Container %s is %s, leaving it to Docker", ctr.Name, ctr.State)
+			return
+		}
+		w.handleStopped(ctx, ctr, state)
 		return
 	}
 
@@ -327,6 +334,67 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 	} else {
 		log.Infof("Container %s unhealthy but within observation period (%d/%d) or threshold not met", ctr.Name, state.consecutiveUnhealthy, w.config.UnhealthyThreshold)
 	}
+}
+
+// deliberateStopExitCodes are the exit codes a deliberate stop leaves behind:
+// a clean exit, or death by the signals `docker stop` / `docker kill` send
+// (SIGINT 130, SIGQUIT 131 e.g. nginx's STOPSIGNAL, SIGKILL 137 after the stop
+// timeout, SIGTERM 143). An OOM kill also exits 137 but sets OOMKilled.
+var deliberateStopExitCodes = map[int]bool{0: true, 130: true, 131: true, 137: true, 143: true}
+
+// shouldRevive decides whether a container that went from running to stopped
+// is a crash DockWarden should start again. ctr must come from GetContainer
+// (inspect), because a list summary carries no restart policy or exit state.
+//
+// A container is left stopped when:
+//   - its restart policy is "no" (or unset): nothing asked for it to be kept
+//     up, and `docker update --restart=no; docker stop` is how a service is
+//     retired or paused (rl9 tts-bn was revived twice, 2026-11-09);
+//   - it exited cleanly or by a stop signal and was not OOM-killed: that is
+//     `docker stop` / `docker kill` (or a deliberate exit), which Docker itself
+//     does not restart either.
+//
+// Everything else (always / unless-stopped / on-failure containers that died
+// with an error exit code or were OOM-killed, and that Docker is not already
+// restarting) is revived as before.
+func shouldRevive(ctr docker.Container) (bool, string) {
+	switch ctr.RestartPolicy {
+	case "", "no":
+		return false, `restart policy is "no"`
+	}
+	if ctr.OOMKilled {
+		return true, "OOM-killed"
+	}
+	if deliberateStopExitCodes[ctr.ExitCode] {
+		return false, fmt.Sprintf("exit code %d (clean exit or stop signal, not OOM-killed)", ctr.ExitCode)
+	}
+	return true, fmt.Sprintf("exit code %d", ctr.ExitCode)
+}
+
+// handleStopped inspects a container that is no longer running and either
+// revives it (a crash) or stops tracking it as running (a deliberate stop).
+func (w *Watcher) handleStopped(ctx context.Context, ctr docker.Container, state *containerState) {
+	info, err := w.client.GetContainer(ctx, ctr.ID)
+	if err != nil {
+		// Fail closed: do not start something we could not inspect. Keep
+		// lastSeenRunning so the next tick tries again.
+		log.Errorf("Container %s stopped (state: %s) but could not be inspected, not reviving: %v", ctr.Name, ctr.State, err)
+		return
+	}
+	if info.IsRunning() || info.IsRestarting() || info.IsPaused() {
+		// It changed state since the list; the next tick handles it.
+		return
+	}
+
+	revive, reason := shouldRevive(info)
+	if !revive {
+		log.Infof("Container %s stopped (state: %s, %s, restart policy %q): treated as a deliberate stop, not reviving", ctr.Name, info.State, reason, info.RestartPolicy)
+		state.lastSeenRunning = false
+		return
+	}
+
+	log.Warnf("Container %s has stopped unexpectedly (state: %s, %s, restart policy %q)", ctr.Name, info.State, reason, info.RestartPolicy)
+	w.handleCrashed(ctx, ctr, state)
 }
 
 // handleCrashed handles a container that has stopped unexpectedly

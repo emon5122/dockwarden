@@ -19,6 +19,11 @@ type Container struct {
 	Labels       map[string]string
 	Created      time.Time
 	HealthStatus string
+
+	// Filled only by GetContainer (inspect); a list summary leaves them zero.
+	RestartPolicy string // HostConfig.RestartPolicy.Name: "", "no", "always", "unless-stopped", "on-failure"
+	ExitCode      int    // State.ExitCode of the last run
+	OOMKilled     bool   // State.OOMKilled of the last run
 }
 
 // IsRunning returns true if the container is running
@@ -29,6 +34,11 @@ func (c Container) IsRunning() bool {
 // IsRestarting returns true if the container is in the restarting state
 func (c Container) IsRestarting() bool {
 	return c.State == "restarting"
+}
+
+// IsPaused returns true if the container is paused
+func (c Container) IsPaused() bool {
+	return c.State == "paused"
 }
 
 // IsHealthy returns true if the container is healthy

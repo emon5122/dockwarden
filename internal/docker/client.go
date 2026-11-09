@@ -906,6 +906,15 @@ func containerFromInspect(info container.InspectResponse) Container {
 
 	created, _ := time.Parse(time.RFC3339Nano, info.Created)
 
+	restartPolicy := ""
+	if info.HostConfig != nil {
+		restartPolicy = string(info.HostConfig.RestartPolicy.Name)
+	}
+	exitCode, oomKilled := 0, false
+	if info.State != nil {
+		exitCode, oomKilled = info.State.ExitCode, info.State.OOMKilled
+	}
+
 	return Container{
 		ID:           info.ID,
 		Name:         name,
@@ -916,5 +925,9 @@ func containerFromInspect(info container.InspectResponse) Container {
 		Labels:       info.Config.Labels,
 		Created:      created,
 		HealthStatus: healthStatus,
+
+		RestartPolicy: restartPolicy,
+		ExitCode:      exitCode,
+		OOMKilled:     oomKilled,
 	}
 }
