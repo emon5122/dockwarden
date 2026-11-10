@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.0](https://github.com/emon5122/dockwarden/compare/v1.4.5...v2.0.0) (2026-11-10)
+
+
+### ⚠ BREAKING CHANGES
+
+* **api:** DOCKWARDEN_API_ENABLED=true now needs DOCKWARDEN_API_TOKEN (or _FILE) of 32+ characters, otherwise the API and web UI stay off.
+
+### Bug Fixes
+
+* **api:** refuse to run the API and web UI without a 32+ char token ([85e17c2](https://github.com/emon5122/dockwarden/commit/85e17c251c36bfa17538073fcd8557e50f7f7032))
+* **api:** SameSite=Strict session cookie, Secure behind TLS; docs require the API token ([37050f5](https://github.com/emon5122/dockwarden/commit/37050f57740de275420d7908cacf7e4445746a30))
+
 ## [1.4.5](https://github.com/emon5122/dockwarden/compare/v1.4.4...v1.4.5) (2026-11-09)
 
 
