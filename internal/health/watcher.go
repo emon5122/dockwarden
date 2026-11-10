@@ -9,6 +9,7 @@ import (
 	"github.com/emon5122/dockwarden/internal/config"
 	"github.com/emon5122/dockwarden/internal/docker"
 	"github.com/emon5122/dockwarden/internal/notify"
+	"github.com/emon5122/dockwarden/internal/registry"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -75,6 +76,9 @@ type Watcher struct {
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 
+	// gate, when set, holds back unhealthy-restarts while the registry/DNS is down
+	gate *registry.Gate
+
 	// Track container states for retry logic
 	states   map[string]*containerState
 	statesMu sync.RWMutex
@@ -95,6 +99,11 @@ func NewWatcher(client docker.Client, cfg *config.Config) *Watcher {
 		states:   make(map[string]*containerState),
 	}
 }
+
+// SetGate makes the watcher hold restarts of unhealthy containers while the
+// registry/DNS is unreachable (a restart cannot fix that and DNS-dependent
+// services restart-loop: camgw, 2026-11-10). Call before Start.
+func (w *Watcher) SetGate(g *registry.Gate) { w.gate = g }
 
 // Start begins health monitoring with concurrent container checks
 func (w *Watcher) Start() {
@@ -300,6 +309,11 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 			if w.notifier != nil {
 				w.notifier.NotifyContainerGaveUp(ctr.Name, ctr.Image, MaxRestartAttempts)
 			}
+			return
+		}
+
+		if w.config.HealthAction == "restart" && w.gate.Down() {
+			log.Warnf("Container %s is unhealthy but the registry/DNS is unreachable: not restarting it (outage, not a container fault); will re-observe once it is back", ctr.Name)
 			return
 		}
 

@@ -29,6 +29,12 @@ type stubClient struct {
 	recreated  []string
 	startFlags []bool
 	selfID     string
+
+	remoteErr   error // returned by RemoteDigest / PullImage when set (registry outage)
+	remoteCalls int
+	inflight    int // pulls running now
+	maxInflight int // peak simultaneous pulls
+	pullDelay   time.Duration
 }
 
 type stubContainer struct {
@@ -67,9 +73,42 @@ func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Contai
 	return docker.Container{}, fmt.Errorf("no such container %s", id)
 }
 
-func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
+// RemoteDigest / LocalDigests model digests as "d:"+image id.
+func (s *stubClient) RemoteDigest(ctx context.Context, imageName string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.remoteCalls++
+	if s.remoteErr != nil {
+		return "", s.remoteErr
+	}
+	return "d:" + s.registry[imageName], nil
+}
+
+func (s *stubClient) LocalDigests(ctx context.Context, imageName string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id, ok := s.local[imageName]; ok {
+		return []string{"d:" + id}, nil
+	}
+	return nil, nil
+}
+
+func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
+	s.mu.Lock()
+	s.inflight++
+	if s.inflight > s.maxInflight {
+		s.maxInflight = s.inflight
+	}
+	delay := s.pullDelay
+	s.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	s.mu.Lock()
+	defer func() { s.inflight--; s.mu.Unlock() }()
+	if s.remoteErr != nil {
+		return s.remoteErr
+	}
 	s.pulled = append(s.pulled, imageName)
 	if strings.HasPrefix(imageName, "sha256:") {
 		return fmt.Errorf("failed to pull image %s: pull access denied for sha256", imageName)
@@ -262,8 +301,9 @@ func TestRunLeavesUpToDateAndIDCreatedContainers(t *testing.T) {
 	if n := u.totalFailed.Load(); n != 0 {
 		t.Fatalf("failed = %d, want 0", n)
 	}
-	if len(client.pulled) != 1 || client.pulled[0] != "example/web:latest" {
-		t.Fatalf("pulled = %v, want only example/web:latest", client.pulled)
+	// Unchanged digest: the registry is asked, but nothing is pulled.
+	if len(client.pulled) != 0 || client.remoteCalls != 1 {
+		t.Fatalf("pulled = %v, digest checks = %d; want no pull and 1 digest check", client.pulled, client.remoteCalls)
 	}
 }
 
@@ -445,5 +485,175 @@ func TestSplitSelfSkipsTakeoverHelper(t *testing.T) {
 	}
 	if len(others) != 1 || others[0].Name != "dockwarden-takeover-1762603987" {
 		t.Fatalf("others: %+v", others)
+	}
+}
+
+// Regression (R610 2026-11-10): DockWarden pulled dockwarden:latest every
+// minute although the digest never changed. An unchanged remote digest must not
+// pull, for ordinary containers and for the self-update path alike.
+func TestUnchangedDigestSkipsPull(t *testing.T) {
+	c := runningContainer("c1", "app")
+	c.imageID = "sha256:new"
+	client := newStub(c) // local tag == registry == sha256:new
+	u := New(client, &config.Config{})
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.pulled) != 0 {
+		t.Fatalf("pulled %v although the remote digest is unchanged", client.pulled)
+	}
+	if len(client.recreated) != 0 {
+		t.Fatalf("recreated %v although nothing changed", client.recreated)
+	}
+	if client.remoteCalls != 1 {
+		t.Fatalf("expected 1 digest check, got %d", client.remoteCalls)
+	}
+}
+
+func TestChangedDigestStillPulls(t *testing.T) {
+	client := newStub(runningContainer("c1", "app")) // local old, registry new
+	u := New(client, &config.Config{})
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.pulled) != 1 || len(client.recreated) != 1 {
+		t.Fatalf("pulled=%v recreated=%v, want one of each", client.pulled, client.recreated)
+	}
+}
+
+func selfStub(imageID string) *stubClient {
+	self := stubContainer{id: "self1", name: "dockwarden", ref: "emon5122/dockwarden:latest", imageID: imageID}
+	client := newStub(self)
+	client.selfID = "self1"
+	return client
+}
+
+// Self-update checks are rate-limited: with a 1-minute main interval DockWarden
+// asks the registry about itself once per SelfUpdateInterval, not every pass.
+func TestSelfUpdateCheckIsRateLimited(t *testing.T) {
+	client := selfStub("sha256:new") // up to date: no os.Exit path
+	cfg := &config.Config{SelfUpdateInterval: 10 * time.Minute}
+	u := New(client, cfg)
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	u.now = func() time.Time { return now }
+
+	for i := 0; i < 5; i++ {
+		if err := u.Run(); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
+	}
+	if client.remoteCalls != 1 {
+		t.Fatalf("5 passes in 5 minutes made %d registry checks, want 1", client.remoteCalls)
+	}
+	now = now.Add(10 * time.Minute)
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if client.remoteCalls != 2 {
+		t.Fatalf("after the interval: %d registry checks, want 2", client.remoteCalls)
+	}
+	if len(client.pulled) != 0 {
+		t.Fatalf("self pulled %v with an unchanged digest", client.pulled)
+	}
+}
+
+// Pulls never run in parallel by default (a small box hangs), and the limit is configurable.
+func TestPullConcurrency(t *testing.T) {
+	build := func() *stubClient {
+		var cs []stubContainer
+		for _, n := range []string{"a", "b", "c", "d", "e"} {
+			cs = append(cs, runningContainer(n, n)) // 5 distinct refs, all outdated
+		}
+		c := newStub(cs...)
+		c.pullDelay = 20 * time.Millisecond
+		return c
+	}
+
+	client := build()
+	if err := New(client, &config.Config{}).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.pulled) != 5 {
+		t.Fatalf("pulled %d images, want 5", len(client.pulled))
+	}
+	if client.maxInflight != 1 {
+		t.Fatalf("default pull concurrency: peak %d simultaneous pulls, want 1", client.maxInflight)
+	}
+
+	client = build()
+	if err := New(client, &config.Config{PullConcurrency: 3}).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if client.maxInflight < 2 || client.maxInflight > 3 {
+		t.Fatalf("pull-concurrency=3: peak %d simultaneous pulls, want 2..3", client.maxInflight)
+	}
+}
+
+// While DNS/registry is unreachable: no pulls, no recreates, one probe per
+// backoff; once it resolves again the pass resumes and updates.
+func TestRegistryOutageBacksOffAndResumes(t *testing.T) {
+	client := newStub(runningContainer("c1", "a"), runningContainer("c2", "b"), runningContainer("c3", "c"))
+	client.remoteErr = fmt.Errorf("Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host")
+	u := New(client, &config.Config{})
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	u.now = func() time.Time { return now }
+	clock := func() time.Time { return now }
+	g := u.Gate()
+	g.SetClock(clock)
+
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !g.Down() {
+		t.Fatal("gate should be down after a DNS failure")
+	}
+	if client.remoteCalls != 1 {
+		t.Fatalf("outage pass made %d registry calls, want exactly 1 (the probe)", client.remoteCalls)
+	}
+	if len(client.pulled) != 0 || len(client.recreated) != 0 {
+		t.Fatalf("pulled=%v recreated=%v during an outage", client.pulled, client.recreated)
+	}
+
+	// Passes inside the backoff do not touch the registry at all.
+	for i := 0; i < 3; i++ {
+		now = now.Add(5 * time.Second)
+		_ = u.Run()
+	}
+	if client.remoteCalls != 1 {
+		t.Fatalf("registry contacted %d times during backoff, want still 1", client.remoteCalls)
+	}
+
+	// Backoff elapsed, still down: one more probe, longer wait.
+	now = now.Add(time.Minute)
+	_ = u.Run()
+	if client.remoteCalls != 2 {
+		t.Fatalf("after backoff: %d registry calls, want 2", client.remoteCalls)
+	}
+
+	// DNS is back: next probe succeeds and everything updates.
+	client.mu.Lock()
+	client.remoteErr = nil
+	client.mu.Unlock()
+	now = now.Add(time.Hour)
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if g.Down() {
+		t.Fatal("gate should be up again")
+	}
+	if len(client.recreated) != 3 {
+		t.Fatalf("recreated %v after recovery, want all 3", client.recreated)
+	}
+}
+
+// A registry that answers "denied"/"not found" is reachable: it must not trip the gate.
+func TestRegistryRefusalIsNotAnOutage(t *testing.T) {
+	client := newStub(runningContainer("c1", "a"))
+	client.remoteErr = fmt.Errorf("pull access denied for example/a, repository does not exist")
+	u := New(client, &config.Config{})
+	_ = u.Run()
+	if u.Gate().Down() {
+		t.Fatal("an access-denied answer tripped the outage gate")
 	}
 }

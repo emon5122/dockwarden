@@ -65,10 +65,14 @@ type Config struct {
 	MonitorOnly    bool
 	RollingRestart bool
 	StopTimeout    time.Duration
-	LabelEnable    bool
-	LabelName      string
-	LabelSchedule  string
-	Scope          string
+	// PullConcurrency caps simultaneous image pulls (default 1: small boxes hang otherwise)
+	PullConcurrency int
+	// SelfUpdateInterval is the minimum time between DockWarden's own update checks
+	SelfUpdateInterval time.Duration
+	LabelEnable        bool
+	LabelName          string
+	LabelSchedule      string
+	Scope              string
 
 	// Container settings
 	IncludeStopped    bool
@@ -121,6 +125,8 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.Bool("monitor-only", false, "Monitor mode, no changes made")
 	flags.Bool("rolling-restart", false, "Restart containers one at a time")
 	flags.Duration("stop-timeout", 10*time.Second, "Container stop timeout")
+	flags.Int("pull-concurrency", 1, "Maximum number of image pulls running at the same time")
+	flags.Duration("self-update-interval", 5*time.Minute, "Minimum time between DockWarden self-update checks")
 	flags.Bool("label-enable", false, "Only manage containers with enable label")
 	flags.String("label-name", "dockwarden.enable", "Label to check for container management")
 	flags.String("label-schedule", "dockwarden.schedule", "Container label holding a per-container update window (cron spec, optional CRON_TZ= prefix)")
@@ -190,6 +196,8 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		MonitorOnly:        viper.GetBool("monitor-only"),
 		RollingRestart:     viper.GetBool("rolling-restart"),
 		StopTimeout:        durationValue("stop-timeout"),
+		PullConcurrency:    viper.GetInt("pull-concurrency"),
+		SelfUpdateInterval: durationValue("self-update-interval"),
 		LabelEnable:        viper.GetBool("label-enable"),
 		LabelName:          viper.GetString("label-name"),
 		LabelSchedule:      viper.GetString("label-schedule"),
