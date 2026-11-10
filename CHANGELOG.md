@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.0.1](https://github.com/emon5122/dockwarden/compare/v2.0.0...v2.0.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* harden pulls (digest skip, concurrency 1, registry outage backoff) ([#61](https://github.com/emon5122/dockwarden/issues/61)) ([5caecbb](https://github.com/emon5122/dockwarden/commit/5caecbb101aa0743310ec7f64a29e6c7b0a9c34e))
+
 ## [2.0.0](https://github.com/emon5122/dockwarden/compare/v1.4.5...v2.0.0) (2026-11-10)
 
 
