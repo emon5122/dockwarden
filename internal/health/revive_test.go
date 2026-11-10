@@ -5,9 +5,11 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/emon5122/dockwarden/internal/config"
 	"github.com/emon5122/dockwarden/internal/docker"
+	"github.com/emon5122/dockwarden/internal/registry"
 )
 
 // fakeClient serves one container: ListContainers returns its summary (no
@@ -180,4 +182,53 @@ func TestStoppedThenStartedAgainIsTrackedAgain(t *testing.T) {
 	if len(f.started) != 1 {
 		t.Fatalf("crash after manual restart: started %d times, want 1", len(f.started))
 	}
+}
+
+// While the registry/DNS of its image is down an unhealthy container is NOT
+// restarted (camgw was restart-looped 4-5x/hour during the 2026-11-10 outage);
+// once it is reachable again the restart goes ahead and counts. Another
+// registry being down does not hold it back.
+func TestUnhealthyNotRestartedWhileRegistryDown(t *testing.T) {
+	f := &restartFake{fakeClient: fakeClient{ctr: docker.Container{
+		ID: "c1", Name: "camgw", Image: "ghcr.io/nexisltd/camgw:latest", ImageID: "sha256:img", State: "running", HealthStatus: "unhealthy",
+	}}}
+	cfg := &config.Config{HealthAction: "restart", UnhealthyThreshold: 1, ObservationPeriod: 0}
+	w := NewWatcher(f, cfg)
+	g := registry.NewGates()
+	g.SetBackoff(time.Hour, time.Hour)
+	g.Probe = func(ctx context.Context, host string) error { return errors.New("no such host") }
+	w.SetGates(g)
+
+	g.Trip("docker.io/other/img:1", errors.New("dial tcp: lookup registry-1.docker.io: no such host"))
+	w.checkHealthConcurrently()
+	if f.restarts != 1 {
+		t.Fatalf("a different registry being down blocked the restart (restarts=%d)", f.restarts)
+	}
+
+	g.Trip("ghcr.io/nexisltd/camgw:latest", errors.New("dial tcp: lookup ghcr.io: no such host"))
+	for i := 0; i < 5; i++ {
+		w.checkHealthConcurrently()
+	}
+	if f.restarts != 1 {
+		t.Fatalf("restarted during a registry outage (restarts=%d)", f.restarts)
+	}
+
+	g.OK("ghcr.io/nexisltd/camgw:latest")
+	w.checkHealthConcurrently()
+	w.checkHealthConcurrently()
+	if f.restarts < 2 {
+		t.Fatal("unhealthy container never restarted after the registry came back")
+	}
+}
+
+type restartFake struct {
+	fakeClient
+	restarts int
+}
+
+func (r *restartFake) RestartContainer(ctx context.Context, id string, timeout time.Duration, signal string) error {
+	r.mu.Lock()
+	r.restarts++
+	r.mu.Unlock()
+	return nil
 }

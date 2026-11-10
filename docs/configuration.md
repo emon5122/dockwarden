@@ -29,6 +29,8 @@ This document covers all configuration options for DockWarden.
 | `DOCKWARDEN_MONITOR_ONLY` | `false` | Monitor mode, no changes |
 | `DOCKWARDEN_ROLLING_RESTART` | `false` | Restart containers one at a time |
 | `DOCKWARDEN_STOP_TIMEOUT` | `10s` | Container stop timeout |
+| `DOCKWARDEN_PULL_CONCURRENCY` | `1` | Maximum simultaneous image pulls. An image whose registry digest is unchanged is never pulled |
+| `DOCKWARDEN_SELF_UPDATE_INTERVAL` | `5m` | Minimum time between DockWarden's own update checks |
 | `DOCKWARDEN_REVIVE_STOPPED` | `false` | Start stopped containers after updating them |
 
 ### Container Selection
@@ -161,3 +163,7 @@ Generate the auth string with:
 ```bash
 echo -n 'username:password' | base64
 ```
+
+## Registry outages
+
+When the registry or its DNS is unreachable (DNS failure, connection refused, timeout), DockWarden stops pulling and stops restarting unhealthy containers (`health-action=restart`): a restart cannot fix an outage. It probes again after an exponential backoff (30s, doubling, capped at 10m) and resumes as soon as a probe succeeds. A registry that answers with "denied" or "not found" counts as reachable.

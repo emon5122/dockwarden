@@ -32,6 +32,10 @@ type Client interface {
 	PullImage(ctx context.Context, imageName string) error
 	GetImageDigest(ctx context.Context, imageName string) (string, error)
 	GetImageID(ctx context.Context, imageName string) (string, error)
+	// RemoteDigest asks the registry for the manifest digest of imageName (no layers are pulled).
+	RemoteDigest(ctx context.Context, imageName string) (string, error)
+	// LocalDigests returns the registry digests of the local image imageName (empty if none).
+	LocalDigests(ctx context.Context, imageName string) ([]string, error)
 	RemoveImage(ctx context.Context, imageID string) error
 	ContainerLogs(ctx context.Context, id string, follow bool, tail string) (io.ReadCloser, error)
 	CloneContainer(ctx context.Context, id string, newName string) (string, error)
@@ -317,6 +321,33 @@ func (c *dockerClient) GetImageDigest(ctx context.Context, imageName string) (st
 	}
 
 	return inspect.ID, nil
+}
+
+// RemoteDigest returns the manifest digest the registry currently serves for
+// imageName, without pulling anything.
+func (c *dockerClient) RemoteDigest(ctx context.Context, imageName string) (string, error) {
+	res, err := c.api.DistributionInspect(ctx, imageName, dockerclient.DistributionInspectOptions{
+		EncodedRegistryAuth: getRegistryAuth(imageName),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to check registry digest of %s: %w", imageName, err)
+	}
+	return string(res.Descriptor.Digest), nil
+}
+
+// LocalDigests returns the registry digests (sha256:...) recorded for the local image imageName.
+func (c *dockerClient) LocalDigests(ctx context.Context, imageName string) ([]string, error) {
+	inspect, err := c.api.ImageInspect(ctx, imageName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect image %s: %w", imageName, err)
+	}
+	var out []string
+	for _, rd := range inspect.RepoDigests {
+		if i := strings.LastIndex(rd, "@"); i >= 0 {
+			out = append(out, rd[i+1:])
+		}
+	}
+	return out, nil
 }
 
 // GetImageID returns the image config ID for an image (sha256:...)

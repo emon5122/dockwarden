@@ -29,6 +29,13 @@ type stubClient struct {
 	recreated  []string
 	startFlags []bool
 	selfID     string
+
+	remoteErr   error            // returned by RemoteDigest / PullImage when set (registry outage)
+	errFor      map[string]error // per-ref override of remoteErr
+	remoteCalls int
+	inflight    int // pulls running now
+	maxInflight int // peak simultaneous pulls
+	pullDelay   time.Duration
 }
 
 type stubContainer struct {
@@ -67,9 +74,49 @@ func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Contai
 	return docker.Container{}, fmt.Errorf("no such container %s", id)
 }
 
-func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
+func (s *stubClient) errOf(ref string) error {
+	if e, ok := s.errFor[ref]; ok {
+		return e
+	}
+	return s.remoteErr
+}
+
+// RemoteDigest / LocalDigests model digests as "d:"+image id.
+func (s *stubClient) RemoteDigest(ctx context.Context, imageName string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.remoteCalls++
+	if err := s.errOf(imageName); err != nil {
+		return "", err
+	}
+	return "d:" + s.registry[imageName], nil
+}
+
+func (s *stubClient) LocalDigests(ctx context.Context, imageName string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id, ok := s.local[imageName]; ok {
+		return []string{"d:" + id}, nil
+	}
+	return nil, nil
+}
+
+func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
+	s.mu.Lock()
+	s.inflight++
+	if s.inflight > s.maxInflight {
+		s.maxInflight = s.inflight
+	}
+	delay := s.pullDelay
+	s.mu.Unlock()
+	if delay > 0 {
+		time.Sleep(delay)
+	}
+	s.mu.Lock()
+	defer func() { s.inflight--; s.mu.Unlock() }()
+	if err := s.errOf(imageName); err != nil {
+		return err
+	}
 	s.pulled = append(s.pulled, imageName)
 	if strings.HasPrefix(imageName, "sha256:") {
 		return fmt.Errorf("failed to pull image %s: pull access denied for sha256", imageName)
@@ -262,8 +309,9 @@ func TestRunLeavesUpToDateAndIDCreatedContainers(t *testing.T) {
 	if n := u.totalFailed.Load(); n != 0 {
 		t.Fatalf("failed = %d, want 0", n)
 	}
-	if len(client.pulled) != 1 || client.pulled[0] != "example/web:latest" {
-		t.Fatalf("pulled = %v, want only example/web:latest", client.pulled)
+	// Unchanged digest: the registry is asked, but nothing is pulled.
+	if len(client.pulled) != 0 || client.remoteCalls != 1 {
+		t.Fatalf("pulled = %v, digest checks = %d; want no pull and 1 digest check", client.pulled, client.remoteCalls)
 	}
 }
 
@@ -445,5 +493,224 @@ func TestSplitSelfSkipsTakeoverHelper(t *testing.T) {
 	}
 	if len(others) != 1 || others[0].Name != "dockwarden-takeover-1762603987" {
 		t.Fatalf("others: %+v", others)
+	}
+}
+
+// Regression (R610 2026-11-10): DockWarden pulled dockwarden:latest every
+// minute although the digest never changed. An unchanged remote digest must not
+// pull, for ordinary containers and for the self-update path alike.
+func TestUnchangedDigestSkipsPull(t *testing.T) {
+	c := runningContainer("c1", "app")
+	c.imageID = "sha256:new"
+	client := newStub(c) // local tag == registry == sha256:new
+	u := New(client, &config.Config{})
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.pulled) != 0 {
+		t.Fatalf("pulled %v although the remote digest is unchanged", client.pulled)
+	}
+	if len(client.recreated) != 0 {
+		t.Fatalf("recreated %v although nothing changed", client.recreated)
+	}
+	if client.remoteCalls != 1 {
+		t.Fatalf("expected 1 digest check, got %d", client.remoteCalls)
+	}
+}
+
+func TestChangedDigestStillPulls(t *testing.T) {
+	client := newStub(runningContainer("c1", "app")) // local old, registry new
+	u := New(client, &config.Config{})
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.pulled) != 1 || len(client.recreated) != 1 {
+		t.Fatalf("pulled=%v recreated=%v, want one of each", client.pulled, client.recreated)
+	}
+}
+
+func selfStub(imageID string) *stubClient {
+	self := stubContainer{id: "self1", name: "dockwarden", ref: "emon5122/dockwarden:latest", imageID: imageID}
+	client := newStub(self)
+	client.selfID = "self1"
+	return client
+}
+
+// Self-update checks are rate-limited: with a 1-minute main interval DockWarden
+// asks the registry about itself once per SelfUpdateInterval, not every pass.
+func TestSelfUpdateCheckIsRateLimited(t *testing.T) {
+	client := selfStub("sha256:new") // up to date: no os.Exit path
+	cfg := &config.Config{SelfUpdateInterval: 10 * time.Minute}
+	u := New(client, cfg)
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	u.now = func() time.Time { return now }
+
+	for i := 0; i < 5; i++ {
+		if err := u.Run(); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Minute)
+	}
+	if client.remoteCalls != 1 {
+		t.Fatalf("5 passes in 5 minutes made %d registry checks, want 1", client.remoteCalls)
+	}
+	now = now.Add(10 * time.Minute)
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if client.remoteCalls != 2 {
+		t.Fatalf("after the interval: %d registry checks, want 2", client.remoteCalls)
+	}
+	if len(client.pulled) != 0 {
+		t.Fatalf("self pulled %v with an unchanged digest", client.pulled)
+	}
+}
+
+// Pulls never run in parallel by default (a small box hangs), and the limit is configurable.
+func TestPullConcurrency(t *testing.T) {
+	build := func() *stubClient {
+		var cs []stubContainer
+		for _, n := range []string{"a", "b", "c", "d", "e"} {
+			cs = append(cs, runningContainer(n, n)) // 5 distinct refs, all outdated
+		}
+		c := newStub(cs...)
+		c.pullDelay = 20 * time.Millisecond
+		return c
+	}
+
+	client := build()
+	if err := New(client, &config.Config{}).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.pulled) != 5 {
+		t.Fatalf("pulled %d images, want 5", len(client.pulled))
+	}
+	if client.maxInflight != 1 {
+		t.Fatalf("default pull concurrency: peak %d simultaneous pulls, want 1", client.maxInflight)
+	}
+
+	client = build()
+	if err := New(client, &config.Config{PullConcurrency: 3}).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if client.maxInflight < 2 || client.maxInflight > 3 {
+		t.Fatalf("pull-concurrency=3: peak %d simultaneous pulls, want 2..3", client.maxInflight)
+	}
+}
+
+func dnsFail(host string) error {
+	return fmt.Errorf("Get \"https://%s/v2/\": dial tcp: lookup %s: no such host", host, host)
+}
+
+// waitFor polls cond for up to 3s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 300; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// While DNS/registry is unreachable: one registry call trips it, then no pulls
+// and no recreates and no more registry calls; the background prober (not the
+// update loop) notices when it is back and the next pass updates everything.
+func TestRegistryOutageBacksOffAndResumes(t *testing.T) {
+	client := newStub(runningContainer("c1", "a"), runningContainer("c2", "b"), runningContainer("c3", "c"))
+	client.remoteErr = dnsFail("registry-1.docker.io")
+	u := New(client, &config.Config{})
+	g := u.Gates()
+	g.SetBackoff(5*time.Millisecond, 20*time.Millisecond)
+	var mu sync.Mutex
+	dnsUp := false
+	probes := 0
+	g.Probe = func(ctx context.Context, host string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		probes++
+		if dnsUp {
+			return nil
+		}
+		return dnsFail(host)
+	}
+
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	ref := "example/a:latest"
+	if !g.Down(ref) {
+		t.Fatal("gate should be down after a DNS failure")
+	}
+	if len(client.pulled) != 0 || len(client.recreated) != 0 {
+		t.Fatalf("pulled=%v recreated=%v during an outage", client.pulled, client.recreated)
+	}
+	if n := u.totalFailed.Load(); n != 0 {
+		t.Fatalf("an outage counted %d failed updates, want 0", n)
+	}
+
+	// More passes while down never touch the registry (the prober does the probing).
+	callsBefore := client.remoteCalls
+	for i := 0; i < 3; i++ {
+		_ = u.Run()
+	}
+	if client.remoteCalls != callsBefore {
+		t.Fatalf("update loop made %d registry calls while the registry was down", client.remoteCalls-callsBefore)
+	}
+
+	waitFor(t, "prober to retry", func() bool { mu.Lock(); defer mu.Unlock(); return probes >= 2 })
+
+	// DNS is back: the prober clears the gate with no update pass involved.
+	client.mu.Lock()
+	client.remoteErr = nil
+	client.mu.Unlock()
+	mu.Lock()
+	dnsUp = true
+	mu.Unlock()
+	waitFor(t, "gate to reopen", func() bool { return !g.Down(ref) })
+
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.recreated) != 3 {
+		t.Fatalf("recreated %v after recovery, want all 3", client.recreated)
+	}
+}
+
+// One dead registry host must not stop updates from the others.
+func TestOutageIsPerRegistryHost(t *testing.T) {
+	bad := stubContainer{id: "c1", name: "bad", ref: "dead.example.invalid/x/bad:latest"}
+	good := runningContainer("c2", "good")
+	client := newStub(bad, good)
+	client.errFor = map[string]error{bad.ref: dnsFail("dead.example.invalid")}
+	u := New(client, &config.Config{})
+	u.Gates().SetBackoff(time.Hour, time.Hour)
+	u.Gates().Probe = func(ctx context.Context, host string) error { return dnsFail(host) }
+
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !u.Gates().Down(bad.ref) || u.Gates().Down(good.ref) {
+		t.Fatal("only the dead host's gate should be down")
+	}
+	if len(client.recreated) != 1 || client.recreated[0] != "c2" {
+		t.Fatalf("recreated %v, want only the healthy host's container c2", client.recreated)
+	}
+}
+
+// A registry that answers "denied"/"not found" is reachable: it must not trip
+// the gate, and it clears one that was tripped.
+func TestRegistryRefusalIsNotAnOutage(t *testing.T) {
+	client := newStub(runningContainer("c1", "a"))
+	client.remoteErr = fmt.Errorf("pull access denied for example/a, repository does not exist")
+	u := New(client, &config.Config{})
+	u.Gates().Probe = func(ctx context.Context, host string) error { return dnsFail(host) }
+	_ = u.Run()
+	if u.Gates().Down("example/a:latest") {
+		t.Fatal("an access-denied answer tripped the outage gate")
+	}
+	if n := u.totalFailed.Load(); n != 1 {
+		t.Fatalf("failed=%d, want the refusal reported as 1 failure", n)
 	}
 }

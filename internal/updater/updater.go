@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/emon5122/dockwarden/internal/config"
 	"github.com/emon5122/dockwarden/internal/docker"
+	"github.com/emon5122/dockwarden/internal/registry"
 	"github.com/emon5122/dockwarden/internal/scheduler"
 	log "github.com/sirupsen/logrus"
 )
@@ -36,6 +38,13 @@ type Updater struct {
 	// Concurrency guard
 	runMu sync.Mutex
 
+	// gates track registry/DNS reachability per host; shared with the health watcher
+	gates *registry.Gates
+	// pullSem caps simultaneous image pulls (Config.PullConcurrency, default 1)
+	pullSem chan struct{}
+	// lastSelfCheck rate-limits the self-update check (Config.SelfUpdateInterval)
+	lastSelfCheck time.Time
+
 	// Statistics
 	totalUpdated atomic.Int64
 	totalFailed  atomic.Int64
@@ -45,12 +54,24 @@ type Updater struct {
 
 // New creates a new Updater
 func New(client docker.Client, cfg *config.Config) *Updater {
+	n := cfg.PullConcurrency
+	if n < 1 {
+		n = 1
+	}
 	return &Updater{
-		client: client,
-		config: cfg,
-		now:    time.Now,
+		client:  client,
+		config:  cfg,
+		now:     time.Now,
+		gates:   registry.NewGates(),
+		pullSem: make(chan struct{}, n),
 	}
 }
+
+// Gates returns the registry reachability gates, to share with the health watcher.
+func (u *Updater) Gates() *registry.Gates { return u.gates }
+
+// errRegistryDown marks a pull skipped because the registry is unreachable.
+var errRegistryDown = errors.New("registry unreachable, pull skipped (backing off)")
 
 // Run executes an update cycle with concurrent container processing
 func (u *Updater) Run() error {
@@ -92,12 +113,14 @@ func (u *Updater) Run() error {
 
 	// Process non-self containers concurrently. All containers of this pass
 	// share one pull cache, so each image ref is pulled exactly once.
-	results := u.processContainersConcurrently(ctx, filtered, newPullCache(u.client))
+	results := u.processContainersConcurrently(ctx, filtered, newPullCache(u))
 
 	// Summarize results
 	var updated, failed int
 	for _, result := range results {
-		if result.Error != nil {
+		if errors.Is(result.Error, errRegistryDown) {
+			log.Debugf("%s: %v", result.ContainerName, result.Error)
+		} else if result.Error != nil {
 			log.Errorf("Failed to process %s: %v", result.ContainerName, result.Error)
 			failed++
 		} else if result.Updated {
@@ -167,6 +190,14 @@ func (u *Updater) handleSelfUpdate(ctx context.Context, self docker.Container) {
 		return
 	}
 
+	// Rate-limit: DockWarden's own image rarely changes, so one check per
+	// SelfUpdateInterval is plenty however short the main interval is.
+	if iv := u.config.SelfUpdateInterval; iv > 0 && !u.lastSelfCheck.IsZero() && u.now().Sub(u.lastSelfCheck) < iv {
+		log.Debugf("Self-update check skipped: last check %s ago (interval %s)", u.now().Sub(u.lastSelfCheck).Round(time.Second), iv)
+		return
+	}
+	u.lastSelfCheck = u.now()
+
 	// If still a raw digest, we can't pull by tag. Skip.
 	if strings.HasPrefix(imageName, "sha256:") {
 		log.Debugf("Self-update: cannot determine image tag from %s, skipping", truncateID(imageName))
@@ -177,15 +208,13 @@ func (u *Updater) handleSelfUpdate(ctx context.Context, self docker.Container) {
 	// We compare it against the ImageID of the newly pulled image tag.
 	currentImageID := inspected.ImageID
 
-	if err := u.client.PullImage(ctx, imageName); err != nil {
-		log.Errorf("Self-update: failed to pull image: %v", err)
+	newImageID, err := u.fetchImage(ctx, imageName)
+	if errors.Is(err, errRegistryDown) {
+		log.Debugf("Self-update check skipped: %v", err)
 		return
 	}
-
-	// Get the image ID that the tag now points to after pulling
-	newImageID, err := u.client.GetImageID(ctx, imageName)
 	if err != nil {
-		log.Errorf("Self-update: failed to get new image ID: %v", err)
+		log.Errorf("Self-update: failed to refresh image: %v", err)
 		return
 	}
 
@@ -524,7 +553,7 @@ func (u *Updater) resolveImage(ctx context.Context, ctr docker.Container) (strin
 // image id the ref resolved to, so every container sharing a repo:tag is
 // compared against the same freshly pulled image.
 type pullCache struct {
-	client docker.Client
+	u *Updater
 
 	mu      sync.Mutex
 	entries map[string]*pullEntry
@@ -536,8 +565,8 @@ type pullEntry struct {
 	err     error
 }
 
-func newPullCache(client docker.Client) *pullCache {
-	return &pullCache{client: client, entries: make(map[string]*pullEntry)}
+func newPullCache(u *Updater) *pullCache {
+	return &pullCache{u: u, entries: make(map[string]*pullEntry)}
 }
 
 // pull pulls imageRef (once per pass) and returns the image id the ref points
@@ -552,19 +581,85 @@ func (p *pullCache) pull(ctx context.Context, imageRef string) (string, error) {
 	p.mu.Unlock()
 
 	entry.once.Do(func() {
-		if err := p.client.PullImage(ctx, imageRef); err != nil {
-			entry.err = fmt.Errorf("failed to pull image: %w", err)
-			return
-		}
-		id, err := p.client.GetImageID(ctx, imageRef)
-		if err != nil {
-			entry.err = fmt.Errorf("failed to get new image id: %w", err)
-			return
-		}
-		entry.imageID = id
+		entry.imageID, entry.err = p.u.fetchImage(ctx, imageRef)
 	})
 
 	return entry.imageID, entry.err
+}
+
+// Timeouts for registry calls: one hung call must not hold the only pull slot
+// (and the update cycle lock) for ever.
+const (
+	digestTimeout = 30 * time.Second
+	pullTimeout   = 15 * time.Minute
+)
+
+// fetchImage brings the local tag for imageRef up to date and returns the image
+// id it points to. It
+//   - does nothing while that registry is unreachable (errRegistryDown); the
+//     gate's background prober, not this loop, decides when it is back,
+//   - asks the registry for the manifest digest first and skips the pull when
+//     the local image already has that digest (an unchanged tag costs one tiny
+//     request instead of a pull; R610 pulled dockwarden:latest every minute),
+//   - runs at most Config.PullConcurrency pulls at a time.
+func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, error) {
+	if u.gates.Down(imageRef) {
+		return "", errRegistryDown
+	}
+
+	u.pullSem <- struct{}{}
+	defer func() { <-u.pullSem }()
+
+	// Another pull may have tripped the gate while we waited for a slot.
+	if u.gates.Down(imageRef) {
+		return "", errRegistryDown
+	}
+
+	dctx, cancel := context.WithTimeout(ctx, digestTimeout)
+	remote, err := u.client.RemoteDigest(dctx, imageRef)
+	cancel()
+	if err == nil {
+		u.gates.OK(imageRef)
+		if local, lerr := u.client.LocalDigests(ctx, imageRef); lerr == nil {
+			for _, d := range local {
+				if d == remote {
+					if id, ierr := u.client.GetImageID(ctx, imageRef); ierr == nil {
+						log.Debugf("Image %s unchanged (digest %s), pull skipped", imageRef, truncateID(strings.TrimPrefix(remote, "sha256:")))
+						return id, nil
+					}
+				}
+			}
+		}
+	} else if u.gates.Trip(imageRef, err) {
+		return "", u.outage(imageRef, err)
+	} else {
+		// The registry answered but cannot tell us the digest (denied, private
+		// registry, old daemon): it is reachable; fall through to a normal pull.
+		u.gates.OK(imageRef)
+		log.Debugf("Digest check for %s failed (%v); pulling", imageRef, err)
+	}
+
+	pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
+	err = u.client.PullImage(pctx, imageRef)
+	pcancel()
+	if err != nil {
+		if u.gates.Trip(imageRef, err) {
+			return "", u.outage(imageRef, err)
+		}
+		u.gates.OK(imageRef) // refused, not unreachable
+		return "", fmt.Errorf("failed to pull image: %w", err)
+	}
+	u.gates.OK(imageRef)
+	id, err := u.client.GetImageID(ctx, imageRef)
+	if err != nil {
+		return "", fmt.Errorf("failed to get new image id: %w", err)
+	}
+	return id, nil
+}
+
+func (u *Updater) outage(imageRef string, err error) error {
+	log.Warnf("Registry %s unreachable (%v): pausing its pulls and unhealthy restarts until it answers again", registry.HostOf(imageRef), err)
+	return fmt.Errorf("%w: %v", errRegistryDown, err)
 }
 
 // updateContainer updates a container to the new image
