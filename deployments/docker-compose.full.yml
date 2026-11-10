@@ -28,6 +28,7 @@ services:
       # API & Metrics
       - DOCKWARDEN_API_ENABLED=true
       - DOCKWARDEN_API_PORT=8080
+      - DOCKWARDEN_API_TOKEN_FILE=/run/secrets/dockwarden_api_token  # 32+ chars, required
       - DOCKWARDEN_METRICS=true
 
       # Logging

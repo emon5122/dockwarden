@@ -115,6 +115,11 @@ func TestUILogin(t *testing.T) {
 			sess = c.Value
 		}
 	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == "dockwarden_session" && c.SameSite != http.SameSiteStrictMode {
+			t.Errorf("session cookie SameSite=%v, want Strict", c.SameSite)
+		}
+	}
 	if !s.isValidSession(sess) {
 		t.Fatalf("good login: no valid session")
 	}

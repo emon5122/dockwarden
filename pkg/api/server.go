@@ -239,8 +239,15 @@ func (s *Server) handleLogin(c *gin.Context) {
 	}
 
 	sessionID := s.createSession()
-	c.SetCookie("dockwarden_session", sessionID, 86400, "/", "", false, true)
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie("dockwarden_session", sessionID, 86400, "/", "", isHTTPS(c), true)
 	c.Redirect(http.StatusFound, "/")
+}
+
+// isHTTPS reports whether the client reached us over TLS, directly or through a
+// TLS-terminating reverse proxy (Caddy sets X-Forwarded-Proto).
+func isHTTPS(c *gin.Context) bool {
+	return c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https"
 }
 
 // handleLogout destroys session
@@ -248,7 +255,8 @@ func (s *Server) handleLogout(c *gin.Context) {
 	if sessionID, err := c.Cookie("dockwarden_session"); err == nil {
 		s.deleteSession(sessionID)
 	}
-	c.SetCookie("dockwarden_session", "", -1, "/", "", false, true)
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie("dockwarden_session", "", -1, "/", "", isHTTPS(c), true)
 	c.Redirect(http.StatusFound, "/login")
 }
 

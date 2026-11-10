@@ -71,4 +71,5 @@ fix (revert commit → release PR → merge). Never retag images by hand.
 | GitHub Actions | `GH_TOKEN` | release-please (its tag push triggers the build), ghcr push, GoReleaser |
 | GitHub Actions | `DOCKERHUB_TOKEN` | Docker Hub push (user `emon5122`) |
 | R610 host | `/docker/dockwarden/config.json` (Bitwarden `dockwarden-read-ghcr`) | ghcr pull auth (`read:packages`) |
-| Hosts (optional) | `DOCKWARDEN_API_TOKEN`, notification URLs | API auth and alerts, set in each host's compose env |
+| Hosts with the API on | `DOCKWARDEN_API_TOKEN` / `_FILE` (32+ chars, required: without it the API/UI stay off) | API + web UI auth, set in each host's compose env |
+| Hosts (optional) | notification URLs | alerts, set in each host's compose env |
