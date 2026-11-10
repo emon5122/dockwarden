@@ -1,8 +1,6 @@
 name: trivy
 # Shared scan from nexisltd/.github: fails on fixable CRITICAL vulns/secrets, uploads SARIF + SBOM (nexisltd/security-stack).
 on:
-  push:
-    branches: [main]
   pull_request:
   schedule:
     - cron: "17 3 * * 1"
@@ -11,6 +9,7 @@ permissions:
   contents: read
 jobs:
   trivy:
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--')
     uses: nexisltd/.github/.github/workflows/trivy.yml@main
     with:
       runs-on: '"ubuntu-latest"'
