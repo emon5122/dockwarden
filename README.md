@@ -94,6 +94,7 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -p 8080:8080 \
   -e DOCKWARDEN_API_ENABLED=true \
+  -e DOCKWARDEN_API_TOKEN="$(openssl rand -hex 32)" \
   emon5122/dockwarden
 ```
 
@@ -113,6 +114,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - DOCKWARDEN_API_ENABLED=true
+      - DOCKWARDEN_API_TOKEN_FILE=/run/secrets/api_token  # 32+ chars, required
       - DOCKWARDEN_NOTIFICATION_URL=https://discord.com/api/webhooks/...
       - TZ=Asia/Dhaka
 ```
@@ -154,7 +156,9 @@ DockWarden includes a beautiful, real-time web dashboard built with modern techn
 - 📱 Responsive design for mobile
 - 🌙 Dark mode by default
 
-Enable with `--api-enabled` flag or `DOCKWARDEN_API_ENABLED=true` environment variable.
+Enable with `--api-enabled` flag or `DOCKWARDEN_API_ENABLED=true` environment variable. The API and web UI
+require `DOCKWARDEN_API_TOKEN` (or `DOCKWARDEN_API_TOKEN_FILE`) of at least 32 characters: without one they do
+not start (fail closed) while updates and health watching keep running. Generate one with `openssl rand -hex 32`.
 
 ---
 

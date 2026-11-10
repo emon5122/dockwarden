@@ -68,8 +68,8 @@ looks like a crash. It is left stopped when:
 | `DOCKWARDEN_REGISTRY_SECRET_FILE` | Alternative path (auto-read) |
 | `DOCKWARDEN_NOTIFICATION_URL` | Notification webhook URL |
 | `DOCKWARDEN_NOTIFICATION_URL_FILE` | Path to URL secret file |
-| `DOCKWARDEN_API_TOKEN` | API authentication token |
-| `DOCKWARDEN_API_TOKEN_FILE` | Path to token secret file |
+| `DOCKWARDEN_API_TOKEN` | API/web UI token, 32+ characters; required when the API is enabled (it refuses to start without one) |
+| `DOCKWARDEN_API_TOKEN_FILE` | Path to token secret file (an unreadable file keeps the API off) |
 
 ### API Settings
 

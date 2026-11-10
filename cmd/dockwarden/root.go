@@ -172,7 +172,7 @@ func setupLogging(cfg *config.Config) {
 func startAPIServer(upd *updater.Updater, watcher *health.Watcher) {
 	server := api.NewServer(cfg, client, upd, watcher)
 	if err := server.Start(); err != nil {
-		log.Errorf("API server error: %v", err)
+		log.Errorf("API server not running: %v", err)
 	}
 }
 

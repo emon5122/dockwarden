@@ -254,7 +254,13 @@ func loadSecrets(cfg *Config) error {
 		cfg.APIToken = os.Getenv("DOCKWARDEN_API_TOKEN")
 	}
 	if secretFile := os.Getenv("DOCKWARDEN_API_TOKEN_FILE"); secretFile != "" {
-		if data, err := os.ReadFile(secretFile); err == nil {
+		data, err := os.ReadFile(secretFile)
+		if err != nil {
+			// Fail closed: an unreadable token file must not leave an older
+			// (possibly empty) token in place.
+			logrus.Errorf("Cannot read DOCKWARDEN_API_TOKEN_FILE: %v (API stays off)", err)
+			cfg.APIToken = ""
+		} else {
 			cfg.APIToken = strings.TrimSpace(string(data))
 		}
 	}

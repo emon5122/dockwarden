@@ -77,8 +77,29 @@ func NewServer(cfg *config.Config, client docker.Client, upd *updater.Updater, w
 	return s
 }
 
-// Start starts the web server
+// MinAPITokenLen is the shortest API token DockWarden accepts. The API and the
+// web UI drive the docker socket (stop/restart/recreate/update), so they never
+// run without a strong token.
+const MinAPITokenLen = 32
+
+// ValidateAPIToken returns an error unless token is long enough to protect the
+// API and the web UI.
+func ValidateAPIToken(token string) error {
+	if token == "" {
+		return fmt.Errorf("no API token set (DOCKWARDEN_API_TOKEN or DOCKWARDEN_API_TOKEN_FILE)")
+	}
+	if len(token) < MinAPITokenLen {
+		return fmt.Errorf("API token is %d characters, need at least %d", len(token), MinAPITokenLen)
+	}
+	return nil
+}
+
+// Start starts the web server. It refuses to listen without a valid API token
+// (fail closed): the API and UI would otherwise be open to every caller.
 func (s *Server) Start() error {
+	if err := ValidateAPIToken(s.config.APIToken); err != nil {
+		return fmt.Errorf("refusing to start the API/web UI: %w", err)
+	}
 	addr := fmt.Sprintf(":%d", s.config.APIPort)
 	log.Infof("Starting web server on http://0.0.0.0%s", addr)
 	return s.engine.Run(addr)
@@ -91,9 +112,7 @@ func (s *Server) setupRoutes() {
 
 	// API v1 routes (bearer token auth)
 	v1 := s.engine.Group("/v1")
-	if s.config.APIToken != "" {
-		v1.Use(s.apiAuthMiddleware())
-	}
+	v1.Use(s.apiAuthMiddleware())
 	{
 		v1.GET("/health", s.handleHealth)
 		v1.GET("/info", s.handleInfo)
@@ -117,9 +136,7 @@ func (s *Server) setupRoutes() {
 
 	// Web UI routes (session auth required when token is configured)
 	ui := s.engine.Group("/")
-	if s.config.APIToken != "" {
-		ui.Use(s.uiAuthMiddleware())
-	}
+	ui.Use(s.uiAuthMiddleware())
 	{
 		ui.GET("/", s.handleDashboard)
 		ui.GET("/ui/containers", s.handleUIContainers)
@@ -137,7 +154,7 @@ func (s *Server) apiAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		token := c.GetHeader("Authorization")
 		expected := "Bearer " + s.config.APIToken
-		if subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
+		if !s.tokenConfigured() || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 			return
 		}
@@ -149,13 +166,19 @@ func (s *Server) apiAuthMiddleware() gin.HandlerFunc {
 func (s *Server) uiAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID, err := c.Cookie("dockwarden_session")
-		if err != nil || !s.isValidSession(sessionID) {
+		if !s.tokenConfigured() || err != nil || !s.isValidSession(sessionID) {
 			c.Redirect(http.StatusFound, "/login")
 			c.Abort()
 			return
 		}
 		c.Next()
 	}
+}
+
+// tokenConfigured reports whether a valid API token is set. Every auth check
+// fails closed without one, even if Start's guard is bypassed (tests, embedding).
+func (s *Server) tokenConfigured() bool {
+	return ValidateAPIToken(s.config.APIToken) == nil
 }
 
 func (s *Server) createSession() string {
@@ -194,11 +217,6 @@ func (s *Server) deleteSession(sessionID string) {
 
 // handleLoginPage renders login form
 func (s *Server) handleLoginPage(c *gin.Context) {
-	// If no token configured, redirect to dashboard
-	if s.config.APIToken == "" {
-		c.Redirect(http.StatusFound, "/")
-		return
-	}
 	// If already logged in, redirect
 	if sessionID, err := c.Cookie("dockwarden_session"); err == nil && s.isValidSession(sessionID) {
 		c.Redirect(http.StatusFound, "/")
@@ -215,7 +233,7 @@ func (s *Server) handleLoginPage(c *gin.Context) {
 // handleLogin processes login form
 func (s *Server) handleLogin(c *gin.Context) {
 	token := c.PostForm("token")
-	if subtle.ConstantTimeCompare([]byte(token), []byte(s.config.APIToken)) != 1 {
+	if !s.tokenConfigured() || subtle.ConstantTimeCompare([]byte(token), []byte(s.config.APIToken)) != 1 {
 		c.Redirect(http.StatusFound, "/login?error=invalid")
 		return
 	}
