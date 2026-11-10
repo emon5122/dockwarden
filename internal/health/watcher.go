@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,8 +77,8 @@ type Watcher struct {
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 
-	// gate, when set, holds back unhealthy-restarts while the registry/DNS is down
-	gate *registry.Gate
+	// gates, when set, hold back unhealthy-restarts while the registry/DNS is down
+	gates *registry.Gates
 
 	// Track container states for retry logic
 	states   map[string]*containerState
@@ -100,10 +101,20 @@ func NewWatcher(client docker.Client, cfg *config.Config) *Watcher {
 	}
 }
 
-// SetGate makes the watcher hold restarts of unhealthy containers while the
-// registry/DNS is unreachable (a restart cannot fix that and DNS-dependent
+// registryDown reports whether the registry of ctr's image is unreachable. The
+// list summary shows a bare image id once the tag moved; then no host is known
+// and any outage counts.
+func (w *Watcher) registryDown(ctr docker.Container) bool {
+	if strings.HasPrefix(ctr.Image, "sha256:") {
+		return w.gates.AnyDown()
+	}
+	return w.gates.Down(ctr.Image)
+}
+
+// SetGates makes the watcher hold restarts of unhealthy containers while the
+// registry/DNS of its image is unreachable (a restart cannot fix that and DNS-dependent
 // services restart-loop: camgw, 2026-11-10). Call before Start.
-func (w *Watcher) SetGate(g *registry.Gate) { w.gate = g }
+func (w *Watcher) SetGates(g *registry.Gates) { w.gates = g }
 
 // Start begins health monitoring with concurrent container checks
 func (w *Watcher) Start() {
@@ -312,7 +323,7 @@ func (w *Watcher) handleUnhealthy(ctx context.Context, ctr docker.Container, sta
 			return
 		}
 
-		if w.config.HealthAction == "restart" && w.gate.Down() {
+		if w.config.HealthAction == "restart" && w.registryDown(ctr) {
 			log.Warnf("Container %s is unhealthy but the registry/DNS is unreachable: not restarting it (outage, not a container fault); will re-observe once it is back", ctr.Name)
 			return
 		}

@@ -107,7 +107,7 @@ func run(cmd *cobra.Command, args []string) {
 	var watcher *health.Watcher
 	if cfg.HealthWatch {
 		watcher = health.NewWatcher(client, cfg)
-		watcher.SetGate(upd.Gate())
+		watcher.SetGates(upd.Gates())
 		go watcher.Start()
 	}
 

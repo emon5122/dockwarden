@@ -38,14 +38,12 @@ type Updater struct {
 	// Concurrency guard
 	runMu sync.Mutex
 
-	// gate tracks registry/DNS reachability; shared with the health watcher
-	gate *registry.Gate
+	// gates track registry/DNS reachability per host; shared with the health watcher
+	gates *registry.Gates
 	// pullSem caps simultaneous image pulls (Config.PullConcurrency, default 1)
 	pullSem chan struct{}
 	// lastSelfCheck rate-limits the self-update check (Config.SelfUpdateInterval)
 	lastSelfCheck time.Time
-	// registryCalls counts registry round trips (probe accounting in Run)
-	registryCalls atomic.Int64
 
 	// Statistics
 	totalUpdated atomic.Int64
@@ -64,13 +62,13 @@ func New(client docker.Client, cfg *config.Config) *Updater {
 		client:  client,
 		config:  cfg,
 		now:     time.Now,
-		gate:    registry.NewGate(),
+		gates:   registry.NewGates(),
 		pullSem: make(chan struct{}, n),
 	}
 }
 
-// Gate returns the registry reachability gate, to share with the health watcher.
-func (u *Updater) Gate() *registry.Gate { return u.gate }
+// Gates returns the registry reachability gates, to share with the health watcher.
+func (u *Updater) Gates() *registry.Gates { return u.gates }
 
 // errRegistryDown marks a pull skipped because the registry is unreachable.
 var errRegistryDown = errors.New("registry unreachable, pull skipped (backing off)")
@@ -85,26 +83,6 @@ func (u *Updater) Run() error {
 
 	ctx := context.Background()
 	startTime := time.Now()
-
-	// Registry/DNS down: no pulls, so nothing to update. Back off and let the
-	// first call after the wait act as the probe.
-	wasDown := u.gate.Down()
-	if wasDown && u.gate.RetryIn() > 0 {
-		log.Warnf("Registry unreachable: skipping update check, next probe in %s", u.gate.RetryIn().Round(time.Second))
-		u.recordRun(startTime)
-		return nil
-	}
-	if wasDown {
-		log.Info("Registry was unreachable: probing it with this update check")
-		callsBefore := u.registryCalls.Load()
-		// A probe cycle with no registry call at all (nothing to pull) must not
-		// leave the gate down for ever.
-		defer func() {
-			if u.registryCalls.Load() == callsBefore {
-				u.gate.ReportOK()
-			}
-		}()
-	}
 
 	log.Info("Starting update check...")
 
@@ -609,29 +587,39 @@ func (p *pullCache) pull(ctx context.Context, imageRef string) (string, error) {
 	return entry.imageID, entry.err
 }
 
+// Timeouts for registry calls: one hung call must not hold the only pull slot
+// (and the update cycle lock) for ever.
+const (
+	digestTimeout = 30 * time.Second
+	pullTimeout   = 15 * time.Minute
+)
+
 // fetchImage brings the local tag for imageRef up to date and returns the image
 // id it points to. It
-//   - does nothing while the registry is unreachable (errRegistryDown),
+//   - does nothing while that registry is unreachable (errRegistryDown); the
+//     gate's background prober, not this loop, decides when it is back,
 //   - asks the registry for the manifest digest first and skips the pull when
 //     the local image already has that digest (an unchanged tag costs one tiny
 //     request instead of a pull; R610 pulled dockwarden:latest every minute),
 //   - runs at most Config.PullConcurrency pulls at a time.
 func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, error) {
-	// Wait for a pull slot first: with the default of 1 the probe finishes
-	// (and reopens or re-trips the gate) before the next image looks at it.
-	u.pullSem <- struct{}{}
-	defer func() { <-u.pullSem }()
-
-	// While down, only the one caller whose backoff has elapsed may probe.
-	if u.gate.Down() && !u.gate.Allow() {
+	if u.gates.Down(imageRef) {
 		return "", errRegistryDown
 	}
 
-	u.registryCalls.Add(1)
-	remote, err := u.client.RemoteDigest(ctx, imageRef)
-	switch {
-	case err == nil:
-		u.gate.ReportOK()
+	u.pullSem <- struct{}{}
+	defer func() { <-u.pullSem }()
+
+	// Another pull may have tripped the gate while we waited for a slot.
+	if u.gates.Down(imageRef) {
+		return "", errRegistryDown
+	}
+
+	dctx, cancel := context.WithTimeout(ctx, digestTimeout)
+	remote, err := u.client.RemoteDigest(dctx, imageRef)
+	cancel()
+	if err == nil {
+		u.gates.OK(imageRef)
 		if local, lerr := u.client.LocalDigests(ctx, imageRef); lerr == nil {
 			for _, d := range local {
 				if d == remote {
@@ -642,28 +630,36 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 				}
 			}
 		}
-	case u.gate.ReportFailure(err):
-		log.Warnf("Registry unreachable (%v): pausing pulls and unhealthy restarts, retry in %s", err, u.gate.RetryIn().Round(time.Second))
-		return "", fmt.Errorf("%w: %v", errRegistryDown, err)
-	default:
-		// Registry answered but cannot tell us the digest (private registry,
-		// old daemon): fall through to a normal pull.
+	} else if u.gates.Trip(imageRef, err) {
+		return "", u.outage(imageRef, err)
+	} else {
+		// The registry answered but cannot tell us the digest (denied, private
+		// registry, old daemon): it is reachable; fall through to a normal pull.
+		u.gates.OK(imageRef)
 		log.Debugf("Digest check for %s failed (%v); pulling", imageRef, err)
 	}
 
-	if err := u.client.PullImage(ctx, imageRef); err != nil {
-		if u.gate.ReportFailure(err) {
-			log.Warnf("Registry unreachable (%v): pausing pulls and unhealthy restarts, retry in %s", err, u.gate.RetryIn().Round(time.Second))
-			return "", fmt.Errorf("%w: %v", errRegistryDown, err)
+	pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
+	err = u.client.PullImage(pctx, imageRef)
+	pcancel()
+	if err != nil {
+		if u.gates.Trip(imageRef, err) {
+			return "", u.outage(imageRef, err)
 		}
+		u.gates.OK(imageRef) // refused, not unreachable
 		return "", fmt.Errorf("failed to pull image: %w", err)
 	}
-	u.gate.ReportOK()
+	u.gates.OK(imageRef)
 	id, err := u.client.GetImageID(ctx, imageRef)
 	if err != nil {
 		return "", fmt.Errorf("failed to get new image id: %w", err)
 	}
 	return id, nil
+}
+
+func (u *Updater) outage(imageRef string, err error) error {
+	log.Warnf("Registry %s unreachable (%v): pausing its pulls and unhealthy restarts until it answers again", registry.HostOf(imageRef), err)
+	return fmt.Errorf("%w: %v", errRegistryDown, err)
 }
 
 // updateContainer updates a container to the new image

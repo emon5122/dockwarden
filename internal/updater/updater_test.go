@@ -30,7 +30,8 @@ type stubClient struct {
 	startFlags []bool
 	selfID     string
 
-	remoteErr   error // returned by RemoteDigest / PullImage when set (registry outage)
+	remoteErr   error            // returned by RemoteDigest / PullImage when set (registry outage)
+	errFor      map[string]error // per-ref override of remoteErr
 	remoteCalls int
 	inflight    int // pulls running now
 	maxInflight int // peak simultaneous pulls
@@ -73,13 +74,20 @@ func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Contai
 	return docker.Container{}, fmt.Errorf("no such container %s", id)
 }
 
+func (s *stubClient) errOf(ref string) error {
+	if e, ok := s.errFor[ref]; ok {
+		return e
+	}
+	return s.remoteErr
+}
+
 // RemoteDigest / LocalDigests model digests as "d:"+image id.
 func (s *stubClient) RemoteDigest(ctx context.Context, imageName string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.remoteCalls++
-	if s.remoteErr != nil {
-		return "", s.remoteErr
+	if err := s.errOf(imageName); err != nil {
+		return "", err
 	}
 	return "d:" + s.registry[imageName], nil
 }
@@ -106,8 +114,8 @@ func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
 	}
 	s.mu.Lock()
 	defer func() { s.inflight--; s.mu.Unlock() }()
-	if s.remoteErr != nil {
-		return s.remoteErr
+	if err := s.errOf(imageName); err != nil {
+		return err
 	}
 	s.pulled = append(s.pulled, imageName)
 	if strings.HasPrefix(imageName, "sha256:") {
@@ -590,70 +598,119 @@ func TestPullConcurrency(t *testing.T) {
 	}
 }
 
-// While DNS/registry is unreachable: no pulls, no recreates, one probe per
-// backoff; once it resolves again the pass resumes and updates.
+func dnsFail(host string) error {
+	return fmt.Errorf("Get \"https://%s/v2/\": dial tcp: lookup %s: no such host", host, host)
+}
+
+// waitFor polls cond for up to 3s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 300; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// While DNS/registry is unreachable: one registry call trips it, then no pulls
+// and no recreates and no more registry calls; the background prober (not the
+// update loop) notices when it is back and the next pass updates everything.
 func TestRegistryOutageBacksOffAndResumes(t *testing.T) {
 	client := newStub(runningContainer("c1", "a"), runningContainer("c2", "b"), runningContainer("c3", "c"))
-	client.remoteErr = fmt.Errorf("Get \"https://registry-1.docker.io/v2/\": dial tcp: lookup registry-1.docker.io: no such host")
+	client.remoteErr = dnsFail("registry-1.docker.io")
 	u := New(client, &config.Config{})
-	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
-	u.now = func() time.Time { return now }
-	clock := func() time.Time { return now }
-	g := u.Gate()
-	g.SetClock(clock)
+	g := u.Gates()
+	g.SetBackoff(5*time.Millisecond, 20*time.Millisecond)
+	var mu sync.Mutex
+	dnsUp := false
+	probes := 0
+	g.Probe = func(ctx context.Context, host string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		probes++
+		if dnsUp {
+			return nil
+		}
+		return dnsFail(host)
+	}
 
 	if err := u.Run(); err != nil {
 		t.Fatal(err)
 	}
-	if !g.Down() {
+	ref := "example/a:latest"
+	if !g.Down(ref) {
 		t.Fatal("gate should be down after a DNS failure")
-	}
-	if client.remoteCalls != 1 {
-		t.Fatalf("outage pass made %d registry calls, want exactly 1 (the probe)", client.remoteCalls)
 	}
 	if len(client.pulled) != 0 || len(client.recreated) != 0 {
 		t.Fatalf("pulled=%v recreated=%v during an outage", client.pulled, client.recreated)
 	}
+	if n := u.totalFailed.Load(); n != 0 {
+		t.Fatalf("an outage counted %d failed updates, want 0", n)
+	}
 
-	// Passes inside the backoff do not touch the registry at all.
+	// More passes while down never touch the registry (the prober does the probing).
+	callsBefore := client.remoteCalls
 	for i := 0; i < 3; i++ {
-		now = now.Add(5 * time.Second)
 		_ = u.Run()
 	}
-	if client.remoteCalls != 1 {
-		t.Fatalf("registry contacted %d times during backoff, want still 1", client.remoteCalls)
+	if client.remoteCalls != callsBefore {
+		t.Fatalf("update loop made %d registry calls while the registry was down", client.remoteCalls-callsBefore)
 	}
 
-	// Backoff elapsed, still down: one more probe, longer wait.
-	now = now.Add(time.Minute)
-	_ = u.Run()
-	if client.remoteCalls != 2 {
-		t.Fatalf("after backoff: %d registry calls, want 2", client.remoteCalls)
-	}
+	waitFor(t, "prober to retry", func() bool { mu.Lock(); defer mu.Unlock(); return probes >= 2 })
 
-	// DNS is back: next probe succeeds and everything updates.
+	// DNS is back: the prober clears the gate with no update pass involved.
 	client.mu.Lock()
 	client.remoteErr = nil
 	client.mu.Unlock()
-	now = now.Add(time.Hour)
+	mu.Lock()
+	dnsUp = true
+	mu.Unlock()
+	waitFor(t, "gate to reopen", func() bool { return !g.Down(ref) })
+
 	if err := u.Run(); err != nil {
 		t.Fatal(err)
-	}
-	if g.Down() {
-		t.Fatal("gate should be up again")
 	}
 	if len(client.recreated) != 3 {
 		t.Fatalf("recreated %v after recovery, want all 3", client.recreated)
 	}
 }
 
-// A registry that answers "denied"/"not found" is reachable: it must not trip the gate.
+// One dead registry host must not stop updates from the others.
+func TestOutageIsPerRegistryHost(t *testing.T) {
+	bad := stubContainer{id: "c1", name: "bad", ref: "dead.example.invalid/x/bad:latest"}
+	good := runningContainer("c2", "good")
+	client := newStub(bad, good)
+	client.errFor = map[string]error{bad.ref: dnsFail("dead.example.invalid")}
+	u := New(client, &config.Config{})
+	u.Gates().SetBackoff(time.Hour, time.Hour)
+	u.Gates().Probe = func(ctx context.Context, host string) error { return dnsFail(host) }
+
+	if err := u.Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !u.Gates().Down(bad.ref) || u.Gates().Down(good.ref) {
+		t.Fatal("only the dead host's gate should be down")
+	}
+	if len(client.recreated) != 1 || client.recreated[0] != "c2" {
+		t.Fatalf("recreated %v, want only the healthy host's container c2", client.recreated)
+	}
+}
+
+// A registry that answers "denied"/"not found" is reachable: it must not trip
+// the gate, and it clears one that was tripped.
 func TestRegistryRefusalIsNotAnOutage(t *testing.T) {
 	client := newStub(runningContainer("c1", "a"))
 	client.remoteErr = fmt.Errorf("pull access denied for example/a, repository does not exist")
 	u := New(client, &config.Config{})
+	u.Gates().Probe = func(ctx context.Context, host string) error { return dnsFail(host) }
 	_ = u.Run()
-	if u.Gate().Down() {
+	if u.Gates().Down("example/a:latest") {
 		t.Fatal("an access-denied answer tripped the outage gate")
+	}
+	if n := u.totalFailed.Load(); n != 1 {
+		t.Fatalf("failed=%d, want the refusal reported as 1 failure", n)
 	}
 }
