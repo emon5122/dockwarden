@@ -11,12 +11,50 @@ DockWarden supports per-container configuration using Docker labels.
 | `dockwarden.schedule` | cron spec, optional `CRON_TZ=<zone>` prefix | - | Only check/update this container while the current minute matches the spec (see below) |
 | `dockwarden.stop-signal` | `SIGTERM`/`SIGQUIT`/etc | container's `STOPSIGNAL` (usually `SIGTERM`) | Stop signal |
 | `dockwarden.stop-timeout` | `<seconds>` or duration (`30s`, `1m`) | `10s` | Stop timeout |
+| `dockwarden.compose` | `true`/`false` | `true` | `false` keeps a compose container on the legacy roll (see [Compose rolls](#compose-rolls)) |
 
 DockWarden also writes one label of its own to containers it recreates:
 `dockwarden.env-overrides` records which environment variables were genuine
 runtime overrides, so the next update can refresh image-provided defaults
 without touching your overrides. It is internal bookkeeping — don't set it
 yourself.
+
+## Compose rolls
+
+A container that `docker compose up` created (it carries the
+`com.docker.compose.project`, `.service`, `.project.config_files` and
+`.project.working_dir` labels) is rolled **through its compose project**, so a
+release also applies whatever changed in the deployed compose file: labels
+(`dockwarden.stop-timeout`, ...), `stop_grace_period`, `environment` /
+`env_file`, `mem_limit` / `cpus`, volumes. No manual `docker compose up -d`
+after a release.
+
+How a roll works:
+
+1. A short-lived helper container (DockWarden's own image, which ships
+   `docker-compose`) renders the project with `docker compose config` from the
+   files at their host paths, mounted read-only at the same paths (plus the
+   docker socket). The env file named by `--env-file` at the original `up`
+   (`com.docker.compose.project.environment_file`) is used again.
+2. If the rendered image is not the image DockWarden just pulled, or a variable
+   renders blank (the original `up` probably took it from its shell), or the
+   files cannot be read, DockWarden falls back to the legacy roll: recreate from
+   the old container's config, as before.
+3. DockWarden stops the container itself, with the **longer** of the old and the
+   new stop timeout (`dockwarden.stop-timeout` label or `stop_grace_period`) and
+   the `dockwarden.stop-signal` label, so a drain is never cut short.
+4. The helper runs `docker compose up -d --no-deps --force-recreate --pull never
+   --no-build <service>`. If that fails while the old container still exists,
+   DockWarden recreates and starts it the legacy way.
+
+Only running containers take this path (stopped ones keep the legacy
+semantics), only one roll runs per service per pass (replicas are recreated by
+compose together), and DockWarden must itself run in a container with the
+docker socket bind-mounted (its image is the helper image; behind a socket proxy
+rolls stay legacy). Turn it off with `DOCKWARDEN_COMPOSE_ROLL=false`, or per
+container with the label `dockwarden.compose=false`. Helper containers carry the
+`dockwarden.helper` label and are removed after each run. End-to-end check on a
+real daemon: `test/e2e/compose-roll.sh`.
 
 ## Update Labels
 

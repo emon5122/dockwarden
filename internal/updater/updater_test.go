@@ -43,6 +43,14 @@ type stubContainer struct {
 	ref      string // .Config.Image
 	imageID  string // .Image
 	labels   map[string]string
+	state    string // "" = running
+}
+
+func (c stubContainer) stateOr() string {
+	if c.state == "" {
+		return "running"
+	}
+	return c.state
 }
 
 // ListContainers mimics `docker ps`: once the container's tag points to a
@@ -56,7 +64,7 @@ func (s *stubClient) ListContainers(ctx context.Context, opts docker.ListOptions
 		if s.local[c.ref] != c.imageID {
 			image = c.imageID
 		}
-		out = append(out, docker.Container{ID: c.id, Name: c.name, Image: image, ImageID: c.imageID, State: "running", Labels: c.labels})
+		out = append(out, docker.Container{ID: c.id, Name: c.name, Image: image, ImageID: c.imageID, State: c.stateOr(), Labels: c.labels})
 	}
 	return out, nil
 }
@@ -68,7 +76,7 @@ func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Contai
 	defer s.mu.Unlock()
 	for _, c := range s.containers {
 		if c.id == id {
-			return docker.Container{ID: c.id, Name: c.name, Image: c.ref, ImageID: c.imageID, State: "running"}, nil
+			return docker.Container{ID: c.id, Name: c.name, Image: c.ref, ImageID: c.imageID, State: c.stateOr(), Labels: c.labels}, nil
 		}
 	}
 	return docker.Container{}, fmt.Errorf("no such container %s", id)

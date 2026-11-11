@@ -21,9 +21,10 @@ type Container struct {
 	HealthStatus string
 
 	// Filled only by GetContainer (inspect); a list summary leaves them zero.
-	RestartPolicy string // HostConfig.RestartPolicy.Name: "", "no", "always", "unless-stopped", "on-failure"
-	ExitCode      int    // State.ExitCode of the last run
-	OOMKilled     bool   // State.OOMKilled of the last run
+	RestartPolicy string   // HostConfig.RestartPolicy.Name: "", "no", "always", "unless-stopped", "on-failure"
+	ExitCode      int      // State.ExitCode of the last run
+	OOMKilled     bool     // State.OOMKilled of the last run
+	Env           []string // Config.Env (KEY=value)
 }
 
 // IsRunning returns true if the container is running

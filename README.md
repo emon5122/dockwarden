@@ -32,6 +32,7 @@
 - **Rolling Updates**: Update containers gracefully with configurable strategies
 - **Scheduled Updates**: Cron-style scheduling with timezone support
 - **Auto Cleanup**: Remove old images after update (enabled by default)
+- **Compose-aware Rolls**: Compose containers are rolled through their compose project, so compose file changes (labels, limits, env, stop grace period) apply on the next release without a manual `docker compose up`
 
 ### 🏥 Health Monitoring
 - **Health Checks**: Monitor container health status continuously
