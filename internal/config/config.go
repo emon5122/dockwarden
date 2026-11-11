@@ -65,6 +65,9 @@ type Config struct {
 	MonitorOnly    bool
 	RollingRestart bool
 	StopTimeout    time.Duration
+	// ComposeRoll rolls compose-created containers through their compose
+	// project (docker-compose up in a helper) so compose file changes apply.
+	ComposeRoll bool
 	// PullConcurrency caps simultaneous image pulls (default 1: small boxes hang otherwise)
 	PullConcurrency int
 	// SelfUpdateInterval is the minimum time between DockWarden's own update checks
@@ -125,6 +128,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.Bool("monitor-only", false, "Monitor mode, no changes made")
 	flags.Bool("rolling-restart", false, "Restart containers one at a time")
 	flags.Duration("stop-timeout", 10*time.Second, "Container stop timeout")
+	flags.Bool("compose-roll", true, "Roll compose-created containers via their compose project so compose file changes (labels, limits, env) apply")
 	flags.Int("pull-concurrency", 1, "Maximum number of image pulls running at the same time")
 	flags.Duration("self-update-interval", 5*time.Minute, "Minimum time between DockWarden self-update checks")
 	flags.Bool("label-enable", false, "Only manage containers with enable label")
@@ -196,6 +200,7 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		MonitorOnly:        viper.GetBool("monitor-only"),
 		RollingRestart:     viper.GetBool("rolling-restart"),
 		StopTimeout:        durationValue("stop-timeout"),
+		ComposeRoll:        viper.GetBool("compose-roll"),
 		PullConcurrency:    viper.GetInt("pull-concurrency"),
 		SelfUpdateInterval: durationValue("self-update-interval"),
 		LabelEnable:        viper.GetBool("label-enable"),

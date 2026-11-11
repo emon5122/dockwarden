@@ -42,6 +42,8 @@ type Client interface {
 	GetSelfContainerID() string
 	GetContainerBinds(ctx context.Context, id string) ([]string, error)
 	CreateHelperContainer(ctx context.Context, image string, cmd []string, binds []string) (string, error)
+	// RunHelper runs a short-lived helper container to completion and returns its output.
+	RunHelper(ctx context.Context, spec HelperSpec) (HelperResult, error)
 }
 
 // ClientOptions configures the Docker client

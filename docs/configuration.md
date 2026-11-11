@@ -29,6 +29,7 @@ This document covers all configuration options for DockWarden.
 | `DOCKWARDEN_MONITOR_ONLY` | `false` | Monitor mode, no changes |
 | `DOCKWARDEN_ROLLING_RESTART` | `false` | Restart containers one at a time |
 | `DOCKWARDEN_STOP_TIMEOUT` | `10s` | Container stop timeout |
+| `DOCKWARDEN_COMPOSE_ROLL` | `true` | Roll compose-created containers through their compose project, so compose file changes apply on the next release (see [labels](labels.md#compose-rolls)) |
 | `DOCKWARDEN_PULL_CONCURRENCY` | `1` | Maximum simultaneous image pulls. An image whose registry digest is unchanged is never pulled |
 | `DOCKWARDEN_SELF_UPDATE_INTERVAL` | `5m` | Minimum time between DockWarden's own update checks |
 | `DOCKWARDEN_REVIVE_STOPPED` | `false` | Start stopped containers after updating them |

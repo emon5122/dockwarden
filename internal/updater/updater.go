@@ -44,6 +44,11 @@ type Updater struct {
 	pullSem chan struct{}
 	// lastSelfCheck rate-limits the self-update check (Config.SelfUpdateInterval)
 	lastSelfCheck time.Time
+	// compose is the helper setup for compose rolls in the current pass (nil = off)
+	compose *composeEnv
+	// composeRolls dedupes replicas of one compose service within a pass
+	composeRolls   map[string]*composeOnce
+	composeRollsMu sync.Mutex
 
 	// Statistics
 	totalUpdated atomic.Int64
@@ -100,6 +105,7 @@ func (u *Updater) Run() error {
 	var otherContainers []docker.Container
 	selfID := u.client.GetSelfContainerID()
 	selfContainer, otherContainers = splitSelf(containers, selfID)
+	u.prepareCompose(ctx, selfContainer)
 
 	// Filter non-self containers
 	filtered := u.filterContainers(otherContainers)
@@ -402,6 +408,11 @@ func (u *Updater) filterContainers(containers []docker.Container) []docker.Conta
 
 containerLoop:
 	for _, ctr := range containers {
+		// Never manage DockWarden's own helper containers
+		if ctr.GetLabel(docker.HelperLabel) != "" || isTakeoverHelper(ctr) {
+			continue
+		}
+
 		// Skip disabled containers
 		for _, disabled := range u.config.DisableContainers {
 			if ctr.Name == disabled {
@@ -669,9 +680,24 @@ func (u *Updater) updateContainer(ctx context.Context, ctr docker.Container) err
 
 	log.Infof("Updating container %s", ctr.Name)
 
-	_, err := u.client.RecreateContainer(ctx, ctr.ID, timeout, u.config.ReviveStopped)
-	if err != nil {
-		return fmt.Errorf("failed to recreate container: %w", err)
+	startStopped := u.config.ReviveStopped
+	rolled, err := u.composeRoll(ctx, ctr, timeout)
+	var fb *composeFallback
+	switch {
+	case err == nil && rolled:
+		// done through the compose project
+	case err == nil:
+		// not a compose container (or compose rolls are off): legacy recreate
+		if _, err := u.client.RecreateContainer(ctx, ctr.ID, timeout, startStopped); err != nil {
+			return fmt.Errorf("failed to recreate container: %w", err)
+		}
+	case errors.As(err, &fb):
+		log.Warnf("Container %s: compose roll not possible (%v); recreating from the old container config", ctr.Name, fb.err)
+		if _, err := u.client.RecreateContainer(ctx, ctr.ID, timeout, startStopped || fb.stoppedByUs); err != nil {
+			return fmt.Errorf("failed to recreate container: %w", err)
+		}
+	default:
+		return err
 	}
 
 	if u.config.Cleanup && oldImageID != "" {
@@ -760,7 +786,7 @@ func splitSelf(containers []docker.Container, selfID string) (*docker.Container,
 		for i, ctr := range containers {
 			// A renamed leftover (dockwarden-old) or a self-update take-over helper
 			// (dockwarden-takeover-<ts>, same image) is never us for update purposes.
-			if isSelfContainer(ctr) && !strings.HasSuffix(ctr.Name, "-old") && !isTakeoverHelper(ctr) {
+			if isSelfContainer(ctr) && !strings.HasSuffix(ctr.Name, "-old") && !isTakeoverHelper(ctr) && ctr.GetLabel(docker.HelperLabel) == "" {
 				selfIdx = i
 				break
 			}

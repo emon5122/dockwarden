@@ -36,6 +36,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -o dockwarden \
     ./cmd/dockwarden
 
+# docker-compose, run by DockWarden's compose-roll helpers (static binary)
+FROM docker/compose-bin:v5.7.1 AS compose
+
 # ============================================================================
 # Runtime stage - minimal scratch image
 # ============================================================================
@@ -60,6 +63,9 @@ COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 
 # Copy the binary
 COPY --from=builder /build/dockwarden /dockwarden
+
+# docker-compose for compose rolls (helpers run this image with it as entrypoint)
+COPY --from=compose /docker-compose /usr/local/bin/docker-compose
 
 # Default timezone
 ENV TZ=Asia/Dhaka
