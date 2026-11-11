@@ -59,10 +59,15 @@ func (c *dockerClient) RunHelper(ctx context.Context, spec HelperSpec) (HelperRe
 			Cmd:        spec.Cmd,
 			Env:        spec.Env,
 			Labels:     helperLabels("compose"),
+			// the image's HEALTHCHECK is DockWarden's own; a helper has none
+			Healthcheck: &container.HealthConfig{Test: []string{"NONE"}},
 		},
 		HostConfig: &container.HostConfig{
-			Binds:       spec.Binds,
-			NetworkMode: "none",
+			Binds:          spec.Binds,
+			NetworkMode:    "none",
+			CapDrop:        []string{"ALL"},
+			SecurityOpt:    []string{"no-new-privileges:true"},
+			ReadonlyRootfs: true,
 		},
 		Name: spec.Name,
 	})

@@ -105,7 +105,7 @@ func (u *Updater) Run() error {
 	var otherContainers []docker.Container
 	selfID := u.client.GetSelfContainerID()
 	selfContainer, otherContainers = splitSelf(containers, selfID)
-	u.prepareCompose(ctx, selfContainer)
+	u.prepareCompose(ctx, selfContainer, selfID)
 
 	// Filter non-self containers
 	filtered := u.filterContainers(otherContainers)

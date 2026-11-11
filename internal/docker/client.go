@@ -962,5 +962,6 @@ func containerFromInspect(info container.InspectResponse) Container {
 		RestartPolicy: restartPolicy,
 		ExitCode:      exitCode,
 		OOMKilled:     oomKilled,
+		Env:           info.Config.Env,
 	}
 }

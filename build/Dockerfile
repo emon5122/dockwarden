@@ -37,7 +37,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     ./cmd/dockwarden
 
 # docker-compose, run by DockWarden's compose-roll helpers (static binary)
-FROM docker/compose-bin:v5.7.1 AS compose
+FROM docker/compose-bin:v5.7.1@sha256:6a6704a7ccbc45eb4cc7e5b71dba685e9bc23705c580430f15034b2b5e46ec2b AS compose
 
 # ============================================================================
 # Runtime stage - minimal scratch image

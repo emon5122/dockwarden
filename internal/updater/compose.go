@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -70,7 +71,7 @@ const (
 // prepareCompose sets up compose rolls for this pass. They need DockWarden to
 // run in a container (its image is the helper image); otherwise every
 // container keeps the legacy recreate.
-func (u *Updater) prepareCompose(ctx context.Context, self *docker.Container) {
+func (u *Updater) prepareCompose(ctx context.Context, self *docker.Container, selfHint string) {
 	u.compose = nil
 	u.composeRollsMu.Lock()
 	u.composeRolls = map[string]*composeOnce{}
@@ -78,8 +79,19 @@ func (u *Updater) prepareCompose(ctx context.Context, self *docker.Container) {
 	if !u.config.ComposeRoll {
 		return
 	}
-	if self == nil || self.ImageID == "" {
+	if self == nil && selfHint != "" {
+		// Right after start the daemon may not list us as running yet (seen on
+		// the first, run-once pass); an inspect by the hint still works.
+		if c, err := u.client.GetContainer(ctx, selfHint); err == nil && isSelfContainer(c) {
+			self = &c
+		}
+	}
+	if self == nil {
 		log.Debug("Compose rolls off this pass: DockWarden's own container was not found")
+		return
+	}
+	if self.ImageID == "" {
+		log.Debugf("Compose rolls off this pass: no image ID for DockWarden's container %s", self.Name)
 		return
 	}
 	// The helper gets the same daemon socket DockWarden has. Without a
@@ -99,6 +111,25 @@ func (u *Updater) prepareCompose(ctx context.Context, self *docker.Container) {
 		return
 	}
 	u.compose = &composeEnv{image: self.ImageID, socketBind: socketSrc + ":" + helperSocketPath}
+	u.removeStaleHelpers(ctx)
+}
+
+// removeStaleHelpers removes finished helpers a previous DockWarden left behind
+// (it died before removing them). Running ones are left alone: an orphaned
+// `up` finishes on its own and is removed on a later pass.
+func (u *Updater) removeStaleHelpers(ctx context.Context) {
+	helpers, err := u.client.ListContainers(ctx, docker.ListOptions{All: true, LabelFilter: docker.HelperLabel})
+	if err != nil {
+		return
+	}
+	for _, h := range helpers {
+		if h.GetLabel(docker.HelperLabel) == "" || h.IsRunning() {
+			continue
+		}
+		if err := u.client.RemoveContainer(ctx, h.ID); err != nil {
+			log.Debugf("remove stale helper %s: %v", h.Name, err)
+		}
+	}
 }
 
 // composeRoll rolls ctr through its compose project. rolled=false with a nil
@@ -126,17 +157,21 @@ func (u *Updater) composeRoll(ctx context.Context, ctr docker.Container, timeout
 		first = true
 		once.rolled, once.err = u.composeRollOnce(ctx, ctr, project, timeout)
 	})
-	if first || !once.rolled {
-		// the first replica's own result; a failed service roll lets each
-		// further replica take its own (legacy) path
-		if !first {
-			return false, fallback(false, "compose roll of %s failed for a sibling replica", key)
-		}
+	switch {
+	case first:
 		return once.rolled, once.err
+	case once.rolled:
+		// `up` recreated every replica of the service already
+		log.Infof("Container %s: already rolled with compose service %s", ctr.Name, key)
+		return true, nil
 	}
-	// `up` recreated every replica of the service already
-	log.Infof("Container %s: already rolled with compose service %s", ctr.Name, key)
-	return true, nil
+	var fb *composeFallback
+	if errors.As(once.err, &fb) && !fb.stoppedByUs {
+		// compose did nothing (render/check refused): each replica takes the legacy roll
+		return false, fallback(false, "compose roll of %s not possible: %v", key, fb.err)
+	}
+	// compose up ran and failed: leave the other replicas alone this pass
+	return false, fmt.Errorf("compose roll of %s failed for a sibling replica: %w", key, once.err)
 }
 
 func (u *Updater) composeRollOnce(ctx context.Context, ctr docker.Container, p docker.ComposeProject, timeout time.Duration) (bool, error) {
@@ -171,9 +206,23 @@ func (u *Updater) composeRollOnce(ctx context.Context, ctr docker.Container, p d
 	if svc.StopGracePeriod > stopTimeout {
 		stopTimeout = svc.StopGracePeriod
 	}
+	// new label > old label > compose stop_signal > the container's own STOPSIGNAL
 	signal := svc.Labels["dockwarden.stop-signal"]
 	if signal == "" {
 		signal = current.GetStopSignal()
+	}
+	if signal == "" {
+		signal = svc.StopSignal
+	}
+
+	// What the roll changes, keys only (values may be secrets). A variable the
+	// original `up` took from its shell and the file defaults (${VAR:-x}) shows
+	// up here as a changed key.
+	if keys := docker.ChangedEnvKeys(svc.Environment, current.Env); len(keys) > 0 {
+		log.Warnf("Container %s: compose roll changes env %s (from the compose file / env files on disk)", ctr.Name, strings.Join(keys, ","))
+	}
+	if keys := docker.ChangedLabelKeys(svc.Labels, current.Labels); len(keys) > 0 {
+		log.Infof("Container %s: compose roll changes labels %s", ctr.Name, strings.Join(keys, ","))
 	}
 
 	log.Infof("Container %s: rolling through compose project %s (service %s, stop timeout %s)", ctr.Name, p.Project, p.Service, stopTimeout)
@@ -189,11 +238,40 @@ func (u *Updater) composeRollOnce(ctx context.Context, ctr docker.Container, p d
 	}
 
 	// compose up failed after our stop: get the service back up
-	if _, inspectErr := u.client.GetContainer(ctx, ctr.ID); inspectErr == nil {
+	if old, inspectErr := u.client.GetContainer(ctx, ctr.ID); inspectErr == nil {
+		// compose renames the old container to <id>_<name> before it creates the
+		// new one; give the name back (removing a replacement that never ran)
+		// so the legacy recreate keeps the real name
+		if old.Name != ctr.Name {
+			if renameErr := u.reclaimName(ctx, ctr); renameErr != nil {
+				return false, fmt.Errorf("compose up for %s/%s failed (%v) and the old container could not get its name back: %w", p.Project, p.Service, err, renameErr)
+			}
+		}
 		return false, fallback(true, "compose up: %v", err)
 	}
 	u.startComposeService(ctx, p)
 	return false, fmt.Errorf("compose up for %s/%s failed after the old container was replaced: %w", p.Project, p.Service, err)
+}
+
+// reclaimName renames the old container back to its own name, first removing
+// a not-running container compose left holding it.
+func (u *Updater) reclaimName(ctx context.Context, ctr docker.Container) error {
+	all, err := u.client.ListContainers(ctx, docker.ListOptions{All: true})
+	if err != nil {
+		return err
+	}
+	for _, c := range all {
+		if c.Name != ctr.Name || c.ID == ctr.ID {
+			continue
+		}
+		if c.IsRunning() {
+			return fmt.Errorf("container %s (%s) is running under the name", c.Name, truncateID(c.ID))
+		}
+		if err := u.client.RemoveContainer(ctx, c.ID); err != nil {
+			return err
+		}
+	}
+	return u.client.RenameContainer(ctx, ctr.ID, ctr.Name)
 }
 
 // startComposeService starts any stopped container of the service (best effort
@@ -219,7 +297,7 @@ func (u *Updater) startComposeService(ctx context.Context, p docker.ComposeProje
 func (u *Updater) runCompose(ctx context.Context, p docker.ComposeProject, step string, timeout time.Duration, args ...string) (docker.HelperResult, error) {
 	binds := append([]string{u.compose.socketBind}, p.Binds()...)
 	spec := docker.HelperSpec{
-		Name:       fmt.Sprintf("dockwarden-compose-%s-%d", step, u.now().UnixNano()),
+		Name:       fmt.Sprintf("dockwarden-compose-%s-%s-%s-%d", step, p.Project, p.Service, u.now().UnixNano()),
 		Image:      u.compose.image,
 		Entrypoint: []string{docker.ComposeBinary},
 		Cmd:        append(append([]string{"--ansi", "never"}, p.GlobalArgs()...), args...),

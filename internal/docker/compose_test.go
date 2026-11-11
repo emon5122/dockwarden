@@ -53,6 +53,52 @@ func TestComposeProjectOf(t *testing.T) {
 	}
 }
 
+func TestComposeProjectDeniedDirs(t *testing.T) {
+	for _, dir := range []string{"/", "/etc", "/root", "/proc/1", "/var/lib/docker/volumes", "/srv"} {
+		l := composeLabels()
+		l[ComposeWorkingDirLabel] = dir
+		l[ComposeConfigFilesLabel] = "/srv/app/compose.yaml"
+		if _, ok := ComposeProjectOf(l); ok {
+			t.Errorf("working dir %s must never be mounted", dir)
+		}
+	}
+	l := composeLabels()
+	l[ComposeEnvFileLabel] = "/etc/shadow-ish.env" // dir /etc
+	if _, ok := ComposeProjectOf(l); ok {
+		t.Error("env file directly in /etc must not mount /etc")
+	}
+	for _, dir := range []string{"/root/app", "/opt/stack", "/etc/compose/app", "/home/u/app"} {
+		l := composeLabels()
+		l[ComposeWorkingDirLabel] = dir
+		l[ComposeConfigFilesLabel] = dir + "/compose.yaml"
+		if _, ok := ComposeProjectOf(l); !ok {
+			t.Errorf("%s is a normal project dir", dir)
+		}
+	}
+}
+
+func TestChangedKeys(t *testing.T) {
+	env := ChangedEnvKeys(map[string]string{"A": "2", "B": "same", "NEW": "x"}, []string{"A=1", "B=same", "PATH=/bin"})
+	if !reflect.DeepEqual(env, []string{"A", "NEW"}) {
+		t.Fatalf("env keys = %v", env)
+	}
+	labels := ChangedLabelKeys(map[string]string{"dockwarden.stop-timeout": "700", "keep": "1", "com.docker.compose.x": "y"},
+		map[string]string{"keep": "1"})
+	if !reflect.DeepEqual(labels, []string{"dockwarden.stop-timeout"}) {
+		t.Fatalf("label keys = %v", labels)
+	}
+}
+
+func TestParseComposeEnvironment(t *testing.T) {
+	svc, err := ParseComposeConfig([]byte(`{"services":{"a":{"image":"x","environment":{"A":"1","UNSET":null}}}}`), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(svc.Environment, map[string]string{"A": "1"}) {
+		t.Fatalf("environment = %v", svc.Environment)
+	}
+}
+
 func TestComposeGlobalArgs(t *testing.T) {
 	p := ComposeProject{Project: "homepbx-voice", Service: "titli-agent", WorkingDir: "/srv/home-pbx",
 		ConfigFiles: []string{"/srv/home-pbx/compose.voice.yaml"}, EnvFiles: []string{"/srv/home-pbx/voice.env"}}

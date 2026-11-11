@@ -15,7 +15,17 @@ cd /src && docker build -q -f build/Dockerfile -t dockwarden:e2e . >/dev/null &&
 docker run --rm --entrypoint /usr/local/bin/docker-compose dockwarden:e2e version
 docker pull -q busybox:1.36.1 >/dev/null && docker tag busybox:1.36.1 busybox:latest
 OLD=$(docker image inspect busybox:latest --format '{{.Id}}')
-mkdir -p /srv/e2e /srv/e2elegacy
+mkdir -p /srv/e2e /srv/e2elegacy /srv/e2eout /srv/e2eshared
+echo "S=1" > /srv/e2eshared/out.env
+cat > /srv/e2eout/compose.yaml <<'Y'
+services:
+  out:
+    image: busybox:latest
+    command: ["sleep", "3600"]
+    env_file: /srv/e2eshared/out.env
+    labels:
+      dockwarden.enable: "true"
+Y
 cat > /srv/e2e/compose.yaml <<'Y'
 services:
   app:
@@ -39,6 +49,8 @@ services:
 Y
 docker compose -f /srv/e2e/compose.yaml up -d 2>&1 | tail -1
 FROM_SHELL=x docker compose -f /srv/e2elegacy/compose.yaml up -d 2>&1 | tail -1
+docker compose -f /srv/e2eout/compose.yaml up -d 2>&1 | tail -1
+sed -i 's/dockwarden.enable: "true"/dockwarden.enable: "true"\n      e2e.marker: "v2"/' /srv/e2eout/compose.yaml
 # the "release": compose edits a human would otherwise apply with compose up
 cat > /srv/e2e/compose.yaml <<'Y'
 services:
@@ -72,6 +84,10 @@ L=$(docker compose -f /srv/e2elegacy/compose.yaml ps -q leg 2>/dev/null || docke
 limg=$(docker inspect $L --format '{{.Image}}'); llab=$(docker inspect $L --format '{{index .Config.Labels "e2e.marker"}}'); lenv=$(docker inspect $L --format '{{range .Config.Env}}{{println .}}{{end}}' | grep FROM_SHELL)
 echo "legacy (unset var) leg: new_image=$([ "$limg" != "$OLD" ] && echo yes || echo NO) marker='$llab' env=$lenv"
 [ "$limg" != "$OLD" ] && [ -z "$llab" ] && [ "$lenv" = FROM_SHELL=x ] || fail=1
+O=$(docker ps -q -f label=com.docker.compose.service=out)
+oimg=$(docker inspect $O --format '{{.Image}}'); olab=$(docker inspect $O --format '{{index .Config.Labels "e2e.marker"}}'); orun=$(docker inspect $O --format '{{.State.Running}}')
+echo "env_file outside project (not mountable -> legacy) out: new_image=$([ "$oimg" != "$OLD" ] && echo yes || echo NO) marker='$olab' running=$orun"
+[ "$oimg" != "$OLD" ] && [ -z "$olab" ] && [ "$orun" = true ] || fail=1
 left=$(docker ps -a --filter label=dockwarden.helper -q | wc -l); echo "helpers left: $left"; [ "$left" = 0 ] || fail=1
-[ $fail = 0 ] && echo "E2E PASS" || { echo "E2E FAIL"; tail -40 /tmp/dw.log | cut -c1-300; exit 1; }
+[ $fail = 0 ] && echo "E2E PASS" || { echo "E2E FAIL"; grep -iE "compose rolls|compose roll|self|helper" /tmp/dw.log | head -20 | cut -c1-300; tail -40 /tmp/dw.log | cut -c1-300; exit 1; }
 IN

@@ -66,6 +66,13 @@ func ComposeProjectOf(labels map[string]string) (ComposeProject, bool) {
 			return ComposeProject{}, false
 		}
 	}
+	// the helper mounts these directories next to the docker socket: never the
+	// host root or a system tree, whatever a label says
+	for _, b := range p.bindDirs() {
+		if deniedBindDir(b) {
+			return ComposeProject{}, false
+		}
+	}
 	return p, true
 }
 
@@ -98,6 +105,37 @@ func (p ComposeProject) GlobalArgs() []string {
 // identical, so relative paths in the compose file resolve to the same host
 // paths the daemon sees.
 func (p ComposeProject) Binds() []string {
+	kept := p.bindDirs()
+	binds := make([]string, 0, len(kept))
+	for _, d := range kept {
+		binds = append(binds, d+":"+d+":ro")
+	}
+	return binds
+}
+
+// A helper never mounts these host trees (even read-only, next to the docker
+// socket): the whole tree for deniedBindTrees, the exact directory for
+// deniedBindDirs (a project may live below /etc or /opt, but never be /etc).
+var (
+	deniedBindTrees = []string{"/proc", "/sys", "/dev", "/boot", "/var/lib/docker"}
+	deniedBindDirs  = []string{"/", "/root", "/etc", "/usr", "/bin", "/sbin", "/lib", "/var", "/run", "/var/run", "/home", "/opt", "/srv", "/mnt", "/tmp"}
+)
+
+func deniedBindDir(dir string) bool {
+	for _, d := range deniedBindDirs {
+		if dir == d {
+			return true
+		}
+	}
+	for _, t := range deniedBindTrees {
+		if dir == t || strings.HasPrefix(dir, t+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (p ComposeProject) bindDirs() []string {
 	dirs := []string{p.WorkingDir}
 	for _, f := range append(append([]string{}, p.ConfigFiles...), p.EnvFiles...) {
 		dirs = append(dirs, filepath.Dir(f))
@@ -116,17 +154,14 @@ func (p ComposeProject) Binds() []string {
 			kept = append(kept, d)
 		}
 	}
-	binds := make([]string, 0, len(kept))
-	for _, d := range kept {
-		binds = append(binds, d+":"+d+":ro")
-	}
-	return binds
+	return kept
 }
 
 // ComposeService is the part of a rendered compose service DockWarden needs.
 type ComposeService struct {
 	Image           string
 	Labels          map[string]string
+	Environment     map[string]string // KEY -> value; a key compose leaves unset is absent
 	StopGracePeriod time.Duration
 	StopSignal      string
 }
@@ -135,10 +170,11 @@ type ComposeService struct {
 func ParseComposeConfig(raw []byte, service string) (ComposeService, error) {
 	var doc struct {
 		Services map[string]struct {
-			Image           string            `json:"image"`
-			Labels          map[string]string `json:"labels"`
-			StopGracePeriod json.RawMessage   `json:"stop_grace_period"`
-			StopSignal      string            `json:"stop_signal"`
+			Image           string             `json:"image"`
+			Labels          map[string]string  `json:"labels"`
+			Environment     map[string]*string `json:"environment"`
+			StopGracePeriod json.RawMessage    `json:"stop_grace_period"`
+			StopSignal      string             `json:"stop_signal"`
 		} `json:"services"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
@@ -148,7 +184,12 @@ func ParseComposeConfig(raw []byte, service string) (ComposeService, error) {
 	if !ok {
 		return ComposeService{}, fmt.Errorf("service %q not in compose config", service)
 	}
-	out := ComposeService{Image: svc.Image, Labels: svc.Labels, StopSignal: svc.StopSignal}
+	out := ComposeService{Image: svc.Image, Labels: svc.Labels, StopSignal: svc.StopSignal, Environment: map[string]string{}}
+	for k, v := range svc.Environment {
+		if v != nil {
+			out.Environment[k] = *v
+		}
+	}
 	if len(svc.StopGracePeriod) > 0 && string(svc.StopGracePeriod) != "null" {
 		var s string
 		if err := json.Unmarshal(svc.StopGracePeriod, &s); err != nil {
@@ -182,4 +223,40 @@ func SameImageRef(a, b string) bool {
 // shell environment, which a helper cannot reproduce.
 func ComposeUnsetVariable(stderr string) bool {
 	return strings.Contains(stderr, "variable is not set")
+}
+
+// ChangedEnvKeys lists the keys whose rendered value differs from the running
+// container's env (added or changed; sorted). Only keys, never values: env
+// holds secrets.
+func ChangedEnvKeys(rendered map[string]string, containerEnv []string) []string {
+	current := make(map[string]string, len(containerEnv))
+	for _, e := range containerEnv {
+		if k, v, ok := strings.Cut(e, "="); ok {
+			current[k] = v
+		}
+	}
+	var keys []string
+	for k, v := range rendered {
+		if cur, ok := current[k]; !ok || cur != v {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// ChangedLabelKeys lists user labels (not com.docker.compose.*) that the
+// rendered service adds or changes (sorted).
+func ChangedLabelKeys(rendered, current map[string]string) []string {
+	var keys []string
+	for k, v := range rendered {
+		if strings.HasPrefix(k, "com.docker.compose.") {
+			continue
+		}
+		if cur, ok := current[k]; !ok || cur != v {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }

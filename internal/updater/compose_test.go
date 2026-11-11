@@ -15,14 +15,17 @@ import (
 // composeStub adds the calls a compose roll makes to stubClient.
 type composeStub struct {
 	*stubClient
-	render  string // stdout of `config --format json`
-	stderr  string // stderr of `config`
-	upExit  int64
-	upGone  bool // a failed up already removed the old container
-	noSock  bool // DockWarden reaches the daemon through a socket proxy
-	helpers []docker.HelperSpec
-	stops   []stopCall
-	starts  []string
+	render   string // stdout of `config --format json`
+	stderr   string // stderr of `config`
+	upExit   int64
+	upGone   bool // a failed up already removed the old container
+	noSock   bool // DockWarden reaches the daemon through a socket proxy
+	upRename bool // a failed up left the old container renamed and a dead replacement on its name
+	stopErr  error
+	removed  []string
+	helpers  []docker.HelperSpec
+	stops    []stopCall
+	starts   []string
 }
 
 type stopCall struct {
@@ -42,6 +45,31 @@ func (c *composeStub) StopContainer(ctx context.Context, id string, timeout time
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.stops = append(c.stops, stopCall{id, timeout, signal})
+	return c.stopErr
+}
+
+func (c *composeStub) RenameContainer(ctx context.Context, id, name string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.containers {
+		if s.name == name {
+			return fmt.Errorf("name %s in use by %s", name, s.id)
+		}
+	}
+	for i, s := range c.containers {
+		if s.id == id {
+			c.containers[i].name = name
+			return nil
+		}
+	}
+	return fmt.Errorf("no such container %s", id)
+}
+
+func (c *composeStub) RemoveContainer(ctx context.Context, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removed = append(c.removed, id)
+	c.containers = slices.DeleteFunc(c.containers, func(s stubContainer) bool { return s.id == id })
 	return nil
 }
 
@@ -61,8 +89,18 @@ func (c *composeStub) RunHelper(ctx context.Context, spec docker.HelperSpec) (do
 		return docker.HelperResult{Stdout: c.render, Stderr: c.stderr}, nil
 	case slices.Contains(spec.Cmd, "up"):
 		if c.upExit != 0 {
+			if c.upRename {
+				for i, s := range c.containers {
+					if s.id == "b1" {
+						c.containers[i].name = "b1short_" + s.name
+						c.containers = append(c.containers, stubContainer{id: "b1-new", name: s.name, ref: s.ref,
+							imageID: c.local[s.ref], labels: s.labels, state: "created"})
+						break
+					}
+				}
+			}
 			if c.upGone {
-				c.containers = slices.DeleteFunc(c.containers, func(s stubContainer) bool { return s.id == "b1" })
+				c.containers = slices.DeleteFunc(c.containers, func(s stubContainer) bool { return s.id == "b1" || s.id == "b2" })
 			}
 			return docker.HelperResult{ExitCode: c.upExit, Stderr: "boom"}, nil
 		}
@@ -214,13 +252,93 @@ func TestComposeRollUpFailureAfterRemovalStartsService(t *testing.T) {
 		imageID: "sha256:new", labels: bridgeContainer("x").labels})
 	listed := &stoppedLister{composeStub: c}
 	u := New(listed, composeConfig())
-	u.prepareCompose(context.Background(), &docker.Container{ID: "self", ImageID: "sha256:dw"})
+	u.prepareCompose(context.Background(), &docker.Container{ID: "self", ImageID: "sha256:dw"}, "self")
 	ctr := docker.Container{ID: "b1", Name: "b1", Labels: bridgeContainer("b1").labels}
 	if err := u.updateContainer(context.Background(), ctr); err == nil {
 		t.Fatal("a failed up after the old container is gone must be reported")
 	}
 	if len(c.recreated) != 0 || !slices.Equal(c.starts, []string{"b1-new"}) {
 		t.Fatalf("recreated=%v starts=%v", c.recreated, c.starts)
+	}
+}
+
+// compose renames the old container before creating the new one; a failed up
+// must give the old container its name back before the legacy recreate.
+func TestComposeRollUpFailureRestoresRenamedContainer(t *testing.T) {
+	c := newComposeStub(bridgeContainer("b1"))
+	c.upExit, c.upRename = 1, true
+	if err := New(c, composeConfig()).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.removed, []string{"b1-new"}) {
+		t.Fatalf("the dead replacement must be removed: %v", c.removed)
+	}
+	if !slices.Equal(c.recreated, []string{"b1"}) || !c.startFlags[0] {
+		t.Fatalf("legacy recreate + start after the rename: %v %v", c.recreated, c.startFlags)
+	}
+	ctr, _ := c.GetContainer(context.Background(), "b1")
+	if ctr.Name != "wa-call-bridge-bridge-b1" {
+		t.Fatalf("old container name = %q", ctr.Name)
+	}
+}
+
+func TestComposeRollStopFailureLeavesContainer(t *testing.T) {
+	c := newComposeStub(bridgeContainer("b1"))
+	c.stopErr = fmt.Errorf("daemon busy")
+	if err := New(c, composeConfig()).Run(); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range c.helpers {
+		if slices.Contains(h.Cmd, "up") {
+			t.Fatal("no up after a failed stop")
+		}
+	}
+	if len(c.recreated) != 0 {
+		t.Fatalf("no legacy recreate after a failed stop: %v", c.recreated)
+	}
+}
+
+func TestComposeRollSiblingNotTouchedAfterFailedUp(t *testing.T) {
+	c := newComposeStub(bridgeContainer("b1"), bridgeContainer("b2"))
+	c.upExit, c.upGone = 1, true
+	if err := New(c, composeConfig()).Run(); err != nil {
+		t.Fatal(err)
+	}
+	ups := 0
+	for _, h := range c.helpers {
+		if slices.Contains(h.Cmd, "up") {
+			ups++
+		}
+	}
+	if ups != 1 || len(c.recreated) != 0 {
+		t.Fatalf("one up, no legacy recreate of compose-touched replicas: ups=%d recreated=%v", ups, c.recreated)
+	}
+}
+
+func TestComposeRollFallbackHonoursReviveStopped(t *testing.T) {
+	c := newComposeStub(bridgeContainer("b1"))
+	c.render = "oops"
+	cfg := composeConfig()
+	cfg.ReviveStopped = true
+	if err := New(c, cfg).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.recreated, []string{"b1"}) || !c.startFlags[0] {
+		t.Fatalf("revive-stopped must still apply on fallback: %v %v", c.recreated, c.startFlags)
+	}
+}
+
+func TestComposeHelperNameAndSignal(t *testing.T) {
+	c := newComposeStub(bridgeContainer("b1"))
+	c.render = renderBridge(`,"stop_signal":"SIGINT"`)
+	if err := New(c, composeConfig()).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(c.helpers[0].Name, "dockwarden-compose-render-wa-call-bridge-bridge-") {
+		t.Fatalf("helper name %q", c.helpers[0].Name)
+	}
+	if len(c.stops) != 1 || c.stops[0].signal != "SIGINT" {
+		t.Fatalf("compose stop_signal is the fallback signal: %+v", c.stops)
 	}
 }
 
@@ -279,6 +397,28 @@ func TestComposeRollBehindSocketProxyIsLegacy(t *testing.T) {
 	if len(c.helpers) != 0 || !slices.Equal(c.recreated, []string{"b1"}) {
 		t.Fatalf("no docker.sock bind: helpers=%d recreated=%v", len(c.helpers), c.recreated)
 	}
+}
+
+// Right after start Docker may not list DockWarden as running yet: the id hint
+// is inspected instead (seen on run-once passes in the e2e).
+func TestComposeRollSelfNotListedYet(t *testing.T) {
+	c := newComposeStub(bridgeContainer("b1"))
+	c.containers[0].state = "created" // self, not running in the list
+	l := &runningOnly{composeStub: c}
+	if err := New(l, composeConfig()).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.recreated) != 0 || len(c.helpers) != 2 {
+		t.Fatalf("self found by inspect: helpers=%d recreated=%v", len(c.helpers), c.recreated)
+	}
+}
+
+// runningOnly lists only running containers, like `docker ps`.
+type runningOnly struct{ *composeStub }
+
+func (r *runningOnly) ListContainers(ctx context.Context, opts docker.ListOptions) ([]docker.Container, error) {
+	out, err := r.composeStub.ListContainers(ctx, opts)
+	return slices.DeleteFunc(out, func(c docker.Container) bool { return !opts.All && !c.IsRunning() }), err
 }
 
 func TestComposeRollReplicasRollOnce(t *testing.T) {
