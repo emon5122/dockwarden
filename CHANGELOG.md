@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0](https://github.com/emon5122/dockwarden/compare/v2.0.1...v2.1.0) (2026-11-11)
+
+
+### Features
+
+* roll compose containers through their compose project ([#63](https://github.com/emon5122/dockwarden/issues/63)) ([90c6934](https://github.com/emon5122/dockwarden/commit/90c6934d9e80946941ce8e5499bd3daaa7cfcc47))
+
 ## [2.0.1](https://github.com/emon5122/dockwarden/compare/v2.0.0...v2.0.1) (2026-11-10)
 
 
