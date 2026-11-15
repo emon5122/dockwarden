@@ -31,6 +31,7 @@ This document covers all configuration options for DockWarden.
 | `DOCKWARDEN_STOP_TIMEOUT` | `10s` | Container stop timeout |
 | `DOCKWARDEN_COMPOSE_ROLL` | `true` | Roll compose-created containers through their compose project, so compose file changes apply on the next release (see [labels](labels.md#compose-rolls)) |
 | `DOCKWARDEN_PULL_CONCURRENCY` | `1` | Maximum simultaneous image pulls. An image whose registry digest is unchanged is never pulled |
+| `DOCKWARDEN_DIGEST_CONCURRENCY` | `6` | Maximum simultaneous registry digest checks (done before, and independent of, the pull slots) |
 | `DOCKWARDEN_SELF_UPDATE_INTERVAL` | `5m` | Minimum time between DockWarden's own update checks |
 | `DOCKWARDEN_HUB_INTERVAL` | `1h` | Minimum time between registry checks of one `docker.io` image (anonymous Docker Hub pulls are rate limited per IP). `0` = every pass. A new Hub push therefore rolls within this interval; the API "update now" ignores it |
 | `DOCKWARDEN_REVIVE_STOPPED` | `false` | Start stopped containers after updating them |
@@ -41,7 +42,7 @@ This document covers all configuration options for DockWarden.
 |----------|---------|-------------|
 | `DOCKWARDEN_LABEL_ENABLE` | `false` | Only manage labeled containers |
 | `DOCKWARDEN_LABEL_NAME` | `dockwarden.enable` | Label to check |
-| `DOCKWARDEN_SCOPE` | - | Limit to containers with matching scope |
+| `DOCKWARDEN_SCOPE` | - | Limit to containers with this scope label. Unset = unscoped: containers that carry any scope label are skipped (a dedicated scoped instance owns them), like watchtower |
 | `DOCKWARDEN_DISABLE_CONTAINERS` | - | Containers to skip: space-separated in the env var (`a b`); the `--disable-containers` flag takes `a,b` |
 | `DOCKWARDEN_INCLUDE_STOPPED` | `false` | Include stopped containers |
 | `DOCKWARDEN_INCLUDE_RESTARTING` | `false` | Include restarting containers |

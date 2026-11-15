@@ -134,7 +134,7 @@ services:
       - "dockwarden.scope=development"
 ```
 
-Run separate DockWarden instances for each scope:
+Run separate DockWarden instances for each scope. An instance without a scope skips every container that carries a scope label, so scoped containers are never handled twice:
 ```bash
 # Production updates (weekly)
 docker run -e DOCKWARDEN_SCOPE=production -e DOCKWARDEN_SCHEDULE="0 3 * * 0" ...

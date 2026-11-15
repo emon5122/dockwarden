@@ -8,20 +8,20 @@ This guide helps you migrate from Watchtower or Docker Watchdog to DockWarden.
 
 | Watchtower | DockWarden | Notes |
 |------------|------------|-------|
-| `WATCHTOWER_CLEANUP` | `DOCKWARDEN_CLEANUP` | Same behavior |
+| `WATCHTOWER_CLEANUP` | `DOCKWARDEN_CLEANUP` | Same behavior (unscoped instances skip scope-labelled containers) |
 | `WATCHTOWER_SCHEDULE` | `DOCKWARDEN_SCHEDULE` | Same cron format |
 | `WATCHTOWER_POLL_INTERVAL` | `DOCKWARDEN_INTERVAL` | In seconds |
-| `WATCHTOWER_LABEL_ENABLE` | `DOCKWARDEN_LABEL_ENABLE` | Same behavior |
-| `WATCHTOWER_INCLUDE_STOPPED` | `DOCKWARDEN_INCLUDE_STOPPED` | Same behavior |
-| `WATCHTOWER_NO_RESTART` | `DOCKWARDEN_NO_RESTART` | Same behavior |
-| `WATCHTOWER_NO_PULL` | `DOCKWARDEN_NO_PULL` | Same behavior |
-| `WATCHTOWER_MONITOR_ONLY` | `DOCKWARDEN_MONITOR_ONLY` | Same behavior |
-| `WATCHTOWER_ROLLING_RESTART` | `DOCKWARDEN_ROLLING_RESTART` | Same behavior |
-| `WATCHTOWER_TIMEOUT` | `DOCKWARDEN_STOP_TIMEOUT` | Same behavior |
-| `WATCHTOWER_SCOPE` | `DOCKWARDEN_SCOPE` | Same behavior |
+| `WATCHTOWER_LABEL_ENABLE` | `DOCKWARDEN_LABEL_ENABLE` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_INCLUDE_STOPPED` | `DOCKWARDEN_INCLUDE_STOPPED` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_NO_RESTART` | `DOCKWARDEN_NO_RESTART` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_NO_PULL` | `DOCKWARDEN_NO_PULL` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_MONITOR_ONLY` | `DOCKWARDEN_MONITOR_ONLY` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_ROLLING_RESTART` | `DOCKWARDEN_ROLLING_RESTART` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_TIMEOUT` | `DOCKWARDEN_STOP_TIMEOUT` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_SCOPE` | `DOCKWARDEN_SCOPE` | Same behavior (unscoped instances skip scope-labelled containers) |
 | `WATCHTOWER_HTTP_API_UPDATE` | `DOCKWARDEN_API_ENABLED` | Enhanced API |
-| `WATCHTOWER_HTTP_API_TOKEN` | `DOCKWARDEN_API_TOKEN` | Same behavior |
-| `WATCHTOWER_HTTP_API_METRICS` | `DOCKWARDEN_METRICS` | Same behavior |
+| `WATCHTOWER_HTTP_API_TOKEN` | `DOCKWARDEN_API_TOKEN` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHTOWER_HTTP_API_METRICS` | `DOCKWARDEN_METRICS` | Same behavior (unscoped instances skip scope-labelled containers) |
 
 ### Label Mapping
 
@@ -89,8 +89,8 @@ environment:
 | Docker Watchdog | DockWarden | Notes |
 |-----------------|------------|-------|
 | `WATCHDOG_CONTAINER_LABEL` | `DOCKWARDEN_LABEL_NAME` | Default changed |
-| `WATCHDOG_INTERVAL` | `DOCKWARDEN_INTERVAL` | Same behavior |
-| `WATCHDOG_DEFAULT_STOP_TIMEOUT` | `DOCKWARDEN_STOP_TIMEOUT` | Same behavior |
+| `WATCHDOG_INTERVAL` | `DOCKWARDEN_INTERVAL` | Same behavior (unscoped instances skip scope-labelled containers) |
+| `WATCHDOG_DEFAULT_STOP_TIMEOUT` | `DOCKWARDEN_STOP_TIMEOUT` | Same behavior (unscoped instances skip scope-labelled containers) |
 
 ### Configuration Migration
 
