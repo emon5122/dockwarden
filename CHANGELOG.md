@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.1.1](https://github.com/emon5122/dockwarden/compare/v2.1.0...v2.1.1) (2026-11-15)
+
+
+### Bug Fixes
+
+* **updater:** back off on registry 429 and refusals, throttle docker.io checks ([7ffc3c4](https://github.com/emon5122/dockwarden/commit/7ffc3c462eb7b2f16ff0dd5e9a7e80553e26ee64))
+* **updater:** keep 429 hold across good digest checks, stamp hub throttle only on a settled check, cover containerd refusal text ([a217c36](https://github.com/emon5122/dockwarden/commit/a217c3691499f3708ae68b28a2439167443af25f))
+
 ## [2.1.0](https://github.com/emon5122/dockwarden/compare/v2.0.1...v2.1.0) (2026-11-11)
 
 
