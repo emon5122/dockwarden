@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.0](https://github.com/emon5122/dockwarden/compare/v2.1.1...v3.0.0) (2026-11-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* an instance without DOCKWARDEN_SCOPE no longer manages containers that have a dockwarden.scope label; run a scoped instance for them.
+
+### updater
+
+* parallel digest checks, unscoped instances skip scoped containers ([#66](https://github.com/emon5122/dockwarden/issues/66)) ([bc820c5](https://github.com/emon5122/dockwarden/commit/bc820c5a886df05a6823ea337110bed9a01011ac))
+
 ## [2.1.1](https://github.com/emon5122/dockwarden/compare/v2.1.0...v2.1.1) (2026-11-15)
 
 
