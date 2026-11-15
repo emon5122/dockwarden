@@ -697,7 +697,7 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 	}
 
 	pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
-	err = u.client.PullImage(pctx, imageRef)
+	err := u.client.PullImage(pctx, imageRef)
 	pcancel()
 	if err != nil {
 		if u.gates.Trip(imageRef, err) {
