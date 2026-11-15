@@ -49,3 +49,20 @@ func TestGetStopSignal(t *testing.T) {
 		t.Errorf("stop-signal = %q, want SIGQUIT", got)
 	}
 }
+
+func TestInScope(t *testing.T) {
+	voice := Container{Labels: map[string]string{"dockwarden.scope": "voice"}}
+	plain := Container{}
+	cases := []struct {
+		c     Container
+		scope string
+		want  bool
+	}{
+		{voice, "", false}, {plain, "", true}, {voice, "voice", true}, {plain, "voice", false}, {voice, "prod", false},
+	}
+	for i, tc := range cases {
+		if got := tc.c.InScope(tc.scope); got != tc.want {
+			t.Errorf("case %d: InScope(%q)=%v, want %v", i, tc.scope, got, tc.want)
+		}
+	}
+}

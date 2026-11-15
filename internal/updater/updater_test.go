@@ -40,6 +40,7 @@ type stubClient struct {
 	inflight    int              // pulls running now
 	maxInflight int              // peak simultaneous pulls
 	pullDelay   time.Duration
+	digestDelay time.Duration // slept (unlocked) inside RemoteDigest
 }
 
 type stubContainer struct {
@@ -95,6 +96,7 @@ func (s *stubClient) errOf(ref string) error {
 
 // RemoteDigest / LocalDigests model digests as "d:"+image id.
 func (s *stubClient) RemoteDigest(ctx context.Context, imageName string) (string, error) {
+	time.Sleep(s.digestDelay)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.remoteCalls++
@@ -1003,5 +1005,104 @@ func TestRateLimitDoesNotStampHubThrottle(t *testing.T) {
 	_ = u.Run()
 	if client.remoteCalls != n+1 {
 		t.Fatal("hold over but docker.io was not retried (throttle stamped on 429?)")
+	}
+}
+
+// Digest checks run DigestConcurrency at a time, independent of the pull slots.
+func TestDigestChecksRunInParallel(t *testing.T) {
+	const n, delay = 12, 100 * time.Millisecond
+	var cs []stubContainer
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("c%d", i)
+		cs = append(cs, runningContainer(name, name))
+	}
+	client := newStub(cs...)
+	client.digestDelay = delay
+	client.pullDelay = 10 * time.Millisecond
+	start := time.Now()
+	if err := New(client, &config.Config{DigestConcurrency: 6}).Run(); err != nil {
+		t.Fatal(err)
+	}
+	// 12 refs / 6 = 2 rounds of 100ms; serial would take 1.2s.
+	if el := time.Since(start); el > 6*delay {
+		t.Fatalf("digest checks took %v, want about %v (parallel)", el, 2*delay)
+	}
+	if len(client.pulled) != n {
+		t.Fatalf("pulled %d, want %d", len(client.pulled), n)
+	}
+	if client.maxInflight != 1 {
+		t.Fatalf("peak %d simultaneous pulls, want PullConcurrency 1", client.maxInflight)
+	}
+}
+
+// An unscoped instance leaves scope-labelled containers to their own instance;
+// a scoped one handles only its scope.
+func TestScopeFiltering(t *testing.T) {
+	voice := runningContainer("v1", "voice")
+	voice.labels = map[string]string{"dockwarden.scope": "voice"}
+	plain := runningContainer("p1", "plain")
+	other := runningContainer("o1", "other")
+	other.labels = map[string]string{"dockwarden.scope": "prod"}
+
+	names := func(cfg *config.Config) []string {
+		u := New(newStub(voice, plain, other), cfg)
+		list, err := u.client.ListContainers(context.Background(), docker.ListOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, c := range u.filterContainers(list) {
+			out = append(out, c.Name)
+		}
+		return out
+	}
+	if got := names(&config.Config{}); len(got) != 1 || got[0] != "plain" {
+		t.Fatalf("unscoped handled %v, want [plain]", got)
+	}
+	if got := names(&config.Config{Scope: "voice"}); len(got) != 1 || got[0] != "voice" {
+		t.Fatalf("scope=voice handled %v, want [voice]", got)
+	}
+}
+
+// Once one digest check trips the registry, refs still queued for a digest slot
+// must not call it again (the gates are re-checked after the slot is taken).
+func TestDigestGatesRecheckedAfterSlot(t *testing.T) {
+	var cs []stubContainer
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("g%d", i)
+		cs = append(cs, runningContainer(name, name))
+	}
+	client := newStub(cs...)
+	client.remoteErr = dnsFail("registry-1.docker.io")
+	client.digestDelay = 50 * time.Millisecond
+	_ = New(client, &config.Config{DigestConcurrency: 2}).Run()
+	if client.remoteCalls > 2 {
+		t.Fatalf("%d registry calls after the host tripped, want <= digest concurrency (2)", client.remoteCalls)
+	}
+}
+
+// With nothing to update, digest checks must not queue behind a slow pull slot.
+func TestDigestChecksNotBlockedBySlowPull(t *testing.T) {
+	const n, delay = 12, 100 * time.Millisecond
+	var cs []stubContainer
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("u%d", i)
+		cs = append(cs, runningContainer(name, name))
+	}
+	client := newStub(cs...)
+	client.digestDelay = delay
+	client.pullDelay = 500 * time.Millisecond
+	for _, c := range cs {
+		client.registry[c.ref] = client.local[c.ref] // remote digest == local: nothing to update
+	}
+	start := time.Now()
+	if err := New(client, &config.Config{PullConcurrency: 1, DigestConcurrency: 6}).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if el := time.Since(start); el > 6*delay {
+		t.Fatalf("0-update cycle took %v, want about %v", el, 2*delay)
+	}
+	if len(client.pulled) != 0 {
+		t.Fatalf("pulled %v with unchanged digests", client.pulled)
 	}
 }

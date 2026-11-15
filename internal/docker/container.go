@@ -127,6 +127,13 @@ func (c Container) GetStopTimeout(defaultTimeout time.Duration) time.Duration {
 	return defaultTimeout
 }
 
+// InScope reports whether an instance running with the given scope manages the
+// container: a scoped instance only its own scope, an unscoped one only
+// containers without a scope label (those belong to a dedicated scoped instance).
+func (c Container) InScope(scope string) bool {
+	return c.GetScope() == scope
+}
+
 // GetScope returns the scope label value
 func (c Container) GetScope() string {
 	return c.GetLabel("dockwarden.scope")

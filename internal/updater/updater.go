@@ -42,6 +42,10 @@ type Updater struct {
 	gates *registry.Gates
 	// pullSem caps simultaneous image pulls (Config.PullConcurrency, default 1)
 	pullSem chan struct{}
+	// digestSem caps simultaneous manifest-digest checks (Config.DigestConcurrency, default 6)
+	digestSem chan struct{}
+	// scopeSkipLogged remembers containers already logged as skipped for carrying a scope label
+	scopeSkipLogged sync.Map
 	// hubChecked is when each docker.io ref last got an answer from its registry
 	// (Config.HubInterval throttle); in memory, so a restart re-checks once.
 	hubChecked   map[string]time.Time
@@ -67,12 +71,17 @@ func New(client docker.Client, cfg *config.Config) *Updater {
 	if n < 1 {
 		n = 1
 	}
+	d := cfg.DigestConcurrency
+	if d < 1 {
+		d = 1
+	}
 	return &Updater{
-		client:  client,
-		config:  cfg,
-		now:     time.Now,
-		gates:   registry.NewGates(),
-		pullSem: make(chan struct{}, n),
+		client:    client,
+		config:    cfg,
+		now:       time.Now,
+		gates:     registry.NewGates(),
+		pullSem:   make(chan struct{}, n),
+		digestSem: make(chan struct{}, d),
 
 		hubChecked: map[string]time.Time{},
 	}
@@ -456,6 +465,18 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container, pu
 func (u *Updater) filterContainers(containers []docker.Container) []docker.Container {
 	filtered := make([]docker.Container, 0, len(containers))
 
+	// Forget scope-skip log entries of containers that are gone.
+	present := make(map[string]struct{}, len(containers))
+	for _, ctr := range containers {
+		present[ctr.ID] = struct{}{}
+	}
+	u.scopeSkipLogged.Range(func(k, _ any) bool {
+		if _, ok := present[k.(string)]; !ok {
+			u.scopeSkipLogged.Delete(k)
+		}
+		return true
+	})
+
 containerLoop:
 	for _, ctr := range containers {
 		// Never manage DockWarden's own helper containers
@@ -477,11 +498,15 @@ containerLoop:
 			}
 		}
 
-		// Check scope
-		if u.config.Scope != "" {
-			if ctr.GetScope() != u.config.Scope {
-				continue
+		// Check scope: a scoped instance handles only its own scope; an unscoped
+		// one leaves scope-labelled containers to the instance that owns them.
+		if !ctr.InScope(u.config.Scope) {
+			if u.config.Scope == "" {
+				if _, seen := u.scopeSkipLogged.LoadOrStore(ctr.ID, true); !seen {
+					log.Debugf("Container %s skipped: scope %q belongs to a scoped instance", ctr.Name, ctr.GetScope())
+				}
 			}
+			continue
 		}
 
 		// Per-container update window (dockwarden.schedule label)
@@ -662,12 +687,11 @@ const (
 //   - asks the registry for the manifest digest first and skips the pull when
 //     the local image already has that digest (an unchanged tag costs one tiny
 //     request instead of a pull; R610 pulled dockwarden:latest every minute),
+//   - runs the digest checks (Config.DigestConcurrency at a time) before taking a
+//     pull slot, so a slow pull never queues the cheap checks behind it,
 //   - runs at most Config.PullConcurrency pulls at a time.
 func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, error) {
-	if u.gates.Down(imageRef) {
-		return "", errRegistryDown
-	}
-	if id, skip, err := u.skipRegistry(ctx, imageRef); skip {
+	if id, done, err := u.checkDigest(ctx, imageRef); done {
 		return id, err
 	}
 
@@ -682,40 +706,8 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 		return id, err
 	}
 
-	dctx, cancel := context.WithTimeout(ctx, digestTimeout)
-	remote, err := u.client.RemoteDigest(dctx, imageRef)
-	cancel()
-	if err == nil {
-		u.gates.OK(imageRef)
-		u.gates.ReleaseRef(imageRef)
-		if local, lerr := u.client.LocalDigests(ctx, imageRef); lerr == nil {
-			for _, d := range local {
-				if d == remote {
-					if id, ierr := u.client.GetImageID(ctx, imageRef); ierr == nil {
-						u.stampHub(imageRef)
-						log.Debugf("Image %s unchanged (digest %s), pull skipped", imageRef, truncateID(strings.TrimPrefix(remote, "sha256:")))
-						return id, nil
-					}
-				}
-			}
-		}
-	} else if u.gates.Trip(imageRef, err) {
-		return "", u.outage(imageRef, err)
-	} else {
-		u.gates.OK(imageRef) // the registry answered
-		switch registry.Classify(err) {
-		case registry.KindRateLimit:
-			return u.held(ctx, imageRef, err)
-		}
-		// A refusal here is not final (private registry with working credentials,
-		// old daemon): fall through to a normal pull; if that is refused the ref is
-		// held. NB: RepoDigests is not a safe "local-only" signal (the containerd image
-		// store fills it for locally built and re-tagged images too).
-		log.Debugf("Digest check for %s failed (%v); pulling", imageRef, err)
-	}
-
 	pctx, pcancel := context.WithTimeout(ctx, pullTimeout)
-	err = u.client.PullImage(pctx, imageRef)
+	err := u.client.PullImage(pctx, imageRef)
 	pcancel()
 	if err != nil {
 		if u.gates.Trip(imageRef, err) {
@@ -972,4 +964,63 @@ func (u *Updater) cleanupStaleContainers(ctx context.Context, originalName strin
 			log.Warnf("Failed to remove stale container %s: %v", ctr.Name, err)
 		}
 	}
+}
+
+// checkDigest runs the gate checks and the manifest-digest comparison under the
+// digest semaphore. done=true means the answer (id, err) is final; done=false
+// means a pull is needed.
+func (u *Updater) checkDigest(ctx context.Context, imageRef string) (id string, done bool, err error) {
+	// Gate checks first, outside the semaphore: a down registry must not wait
+	// behind slow digest calls.
+	if u.gates.Down(imageRef) {
+		return "", true, errRegistryDown
+	}
+	if id, skip, err := u.skipRegistry(ctx, imageRef); skip {
+		return id, true, err
+	}
+
+	u.digestSem <- struct{}{}
+	defer func() { <-u.digestSem }()
+
+	// Another check may have tripped or held the host while we waited for a slot.
+	if u.gates.Down(imageRef) {
+		return "", true, errRegistryDown
+	}
+	if id, skip, err := u.skipRegistry(ctx, imageRef); skip {
+		return id, true, err
+	}
+
+	dctx, cancel := context.WithTimeout(ctx, digestTimeout)
+	remote, err := u.client.RemoteDigest(dctx, imageRef)
+	cancel()
+	if err == nil {
+		u.gates.OK(imageRef)
+		u.gates.ReleaseRef(imageRef)
+		if local, lerr := u.client.LocalDigests(ctx, imageRef); lerr == nil {
+			for _, d := range local {
+				if d == remote {
+					if id, ierr := u.client.GetImageID(ctx, imageRef); ierr == nil {
+						u.stampHub(imageRef)
+						log.Debugf("Image %s unchanged (digest %s), pull skipped", imageRef, truncateID(strings.TrimPrefix(remote, "sha256:")))
+						return id, true, nil
+					}
+				}
+			}
+		}
+		return "", false, nil
+	}
+	if u.gates.Trip(imageRef, err) {
+		return "", true, u.outage(imageRef, err)
+	}
+	u.gates.OK(imageRef) // the registry answered
+	if registry.Classify(err) == registry.KindRateLimit {
+		id, herr := u.held(ctx, imageRef, err)
+		return id, true, herr
+	}
+	// A refusal here is not final (private registry with working credentials,
+	// old daemon): fall through to a normal pull; if that is refused the ref is
+	// held. NB: RepoDigests is not a safe "local-only" signal (the containerd image
+	// store fills it for locally built and re-tagged images too).
+	log.Debugf("Digest check for %s failed (%v); pulling", imageRef, err)
+	return "", false, nil
 }

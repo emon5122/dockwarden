@@ -70,6 +70,8 @@ type Config struct {
 	ComposeRoll bool
 	// PullConcurrency caps simultaneous image pulls (default 1: small boxes hang otherwise)
 	PullConcurrency int
+	// DigestConcurrency caps simultaneous manifest-digest checks (default 6)
+	DigestConcurrency int
 	// SelfUpdateInterval is the minimum time between DockWarden's own update checks
 	SelfUpdateInterval time.Duration
 	// HubInterval is the minimum time between registry checks of one
@@ -134,6 +136,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.Duration("stop-timeout", 10*time.Second, "Container stop timeout")
 	flags.Bool("compose-roll", true, "Roll compose-created containers via their compose project so compose file changes (labels, limits, env) apply")
 	flags.Int("pull-concurrency", 1, "Maximum number of image pulls running at the same time")
+	flags.Int("digest-concurrency", 6, "Maximum number of registry digest checks running at the same time")
 	flags.Duration("self-update-interval", 5*time.Minute, "Minimum time between DockWarden self-update checks")
 	flags.Duration("hub-interval", time.Hour, "Minimum time between registry checks of one docker.io image (0 = every pass)")
 	flags.Bool("label-enable", false, "Only manage containers with enable label")
@@ -207,6 +210,7 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		StopTimeout:        durationValue("stop-timeout"),
 		ComposeRoll:        viper.GetBool("compose-roll"),
 		PullConcurrency:    viper.GetInt("pull-concurrency"),
+		DigestConcurrency:  viper.GetInt("digest-concurrency"),
 		SelfUpdateInterval: durationValue("self-update-interval"),
 		HubInterval:        durationValue("hub-interval"),
 		LabelEnable:        viper.GetBool("label-enable"),
