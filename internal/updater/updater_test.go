@@ -1063,3 +1063,46 @@ func TestScopeFiltering(t *testing.T) {
 		t.Fatalf("scope=voice handled %v, want [voice]", got)
 	}
 }
+
+// Once one digest check trips the registry, refs still queued for a digest slot
+// must not call it again (the gates are re-checked after the slot is taken).
+func TestDigestGatesRecheckedAfterSlot(t *testing.T) {
+	var cs []stubContainer
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("g%d", i)
+		cs = append(cs, runningContainer(name, name))
+	}
+	client := newStub(cs...)
+	client.remoteErr = dnsFail("registry-1.docker.io")
+	client.digestDelay = 50 * time.Millisecond
+	_ = New(client, &config.Config{DigestConcurrency: 2}).Run()
+	if client.remoteCalls > 2 {
+		t.Fatalf("%d registry calls after the host tripped, want <= digest concurrency (2)", client.remoteCalls)
+	}
+}
+
+// With nothing to update, digest checks must not queue behind a slow pull slot.
+func TestDigestChecksNotBlockedBySlowPull(t *testing.T) {
+	const n, delay = 12, 100 * time.Millisecond
+	var cs []stubContainer
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("u%d", i)
+		cs = append(cs, runningContainer(name, name))
+	}
+	client := newStub(cs...)
+	client.digestDelay = delay
+	client.pullDelay = 500 * time.Millisecond
+	for _, c := range cs {
+		client.registry[c.ref] = client.local[c.ref] // remote digest == local: nothing to update
+	}
+	start := time.Now()
+	if err := New(client, &config.Config{PullConcurrency: 1, DigestConcurrency: 6}).Run(); err != nil {
+		t.Fatal(err)
+	}
+	if el := time.Since(start); el > 6*delay {
+		t.Fatalf("0-update cycle took %v, want about %v", el, 2*delay)
+	}
+	if len(client.pulled) != 0 {
+		t.Fatalf("pulled %v with unchanged digests", client.pulled)
+	}
+}

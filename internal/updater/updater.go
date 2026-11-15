@@ -465,6 +465,18 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container, pu
 func (u *Updater) filterContainers(containers []docker.Container) []docker.Container {
 	filtered := make([]docker.Container, 0, len(containers))
 
+	// Forget scope-skip log entries of containers that are gone.
+	present := make(map[string]struct{}, len(containers))
+	for _, ctr := range containers {
+		present[ctr.ID] = struct{}{}
+	}
+	u.scopeSkipLogged.Range(func(k, _ any) bool {
+		if _, ok := present[k.(string)]; !ok {
+			u.scopeSkipLogged.Delete(k)
+		}
+		return true
+	})
+
 containerLoop:
 	for _, ctr := range containers {
 		// Never manage DockWarden's own helper containers
@@ -969,6 +981,14 @@ func (u *Updater) checkDigest(ctx context.Context, imageRef string) (id string, 
 
 	u.digestSem <- struct{}{}
 	defer func() { <-u.digestSem }()
+
+	// Another check may have tripped or held the host while we waited for a slot.
+	if u.gates.Down(imageRef) {
+		return "", true, errRegistryDown
+	}
+	if id, skip, err := u.skipRegistry(ctx, imageRef); skip {
+		return id, true, err
+	}
 
 	dctx, cancel := context.WithTimeout(ctx, digestTimeout)
 	remote, err := u.client.RemoteDigest(dctx, imageRef)
