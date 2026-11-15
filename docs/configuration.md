@@ -32,6 +32,7 @@ This document covers all configuration options for DockWarden.
 | `DOCKWARDEN_COMPOSE_ROLL` | `true` | Roll compose-created containers through their compose project, so compose file changes apply on the next release (see [labels](labels.md#compose-rolls)) |
 | `DOCKWARDEN_PULL_CONCURRENCY` | `1` | Maximum simultaneous image pulls. An image whose registry digest is unchanged is never pulled |
 | `DOCKWARDEN_SELF_UPDATE_INTERVAL` | `5m` | Minimum time between DockWarden's own update checks |
+| `DOCKWARDEN_HUB_INTERVAL` | `1h` | Minimum time between registry checks of one `docker.io` image (anonymous Docker Hub pulls are rate limited per IP). `0` = every pass. A new Hub push therefore rolls within this interval; the API "update now" ignores it |
 | `DOCKWARDEN_REVIVE_STOPPED` | `false` | Start stopped containers after updating them |
 
 ### Container Selection
@@ -168,3 +169,9 @@ echo -n 'username:password' | base64
 ## Registry outages
 
 When the registry or its DNS is unreachable (DNS failure, connection refused, timeout), DockWarden stops pulling and stops restarting unhealthy containers (`health-action=restart`): a restart cannot fix an outage. It probes again after an exponential backoff (30s, doubling, capped at 10m) and resumes as soon as a probe succeeds. A registry that answers with "denied" or "not found" counts as reachable.
+
+## Pull holds
+
+- **429 / toomanyrequests**: the registry host is on hold for 10 min, doubling per consecutive 429, capped at 1 h (the daemon API does not expose the reset header). Containers keep their already-pulled images; health restarts are not held.
+- **401 / 403 / denied / unknown repository**: that image ref is on hold for 15 min, doubling up to 6 h; logged once. Local-only images (built or loaded here) are refused by their registry and so end up parked the same way.
+- Holds live in memory: a restart or an API "update now" clears them. `GET` stats show `held_pulls`.

@@ -2,6 +2,7 @@ package updater
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/emon5122/dockwarden/internal/config"
 	"github.com/emon5122/dockwarden/internal/docker"
+	"github.com/emon5122/dockwarden/internal/registry"
 )
 
 // stubClient models just enough of Docker for the update cycle: local tags
@@ -33,6 +35,7 @@ type stubClient struct {
 	remoteErr   error            // returned by RemoteDigest / PullImage when set (registry outage)
 	errFor      map[string]error // per-ref override of remoteErr
 	remoteCalls int
+	pullCalls   int
 	inflight    int // pulls running now
 	maxInflight int // peak simultaneous pulls
 	pullDelay   time.Duration
@@ -111,6 +114,7 @@ func (s *stubClient) LocalDigests(ctx context.Context, imageName string) ([]stri
 
 func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
 	s.mu.Lock()
+	s.pullCalls++
 	s.inflight++
 	if s.inflight > s.maxInflight {
 		s.maxInflight = s.inflight
@@ -707,18 +711,210 @@ func TestOutageIsPerRegistryHost(t *testing.T) {
 	}
 }
 
+const hubLimit = "toomanyrequests: You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit"
+
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func newClocked(client *stubClient, cfg *config.Config) (*Updater, *fakeClock) {
+	u := New(client, cfg)
+	clk := &fakeClock{t: time.Date(2026, 11, 15, 0, 0, 0, 0, time.UTC)}
+	u.now = clk.now
+	u.Gates().SetClock(clk.now)
+	return u, clk
+}
+
 // A registry that answers "denied"/"not found" is reachable: it must not trip
-// the gate, and it clears one that was tripped.
+// the network gate. The refusal is held per ref: one try, then no registry
+// calls until the wait is over, and it does not count as a failure.
 func TestRegistryRefusalIsNotAnOutage(t *testing.T) {
 	client := newStub(runningContainer("c1", "a"))
 	client.remoteErr = fmt.Errorf("pull access denied for example/a, repository does not exist")
-	u := New(client, &config.Config{})
+	u, clk := newClocked(client, &config.Config{})
 	u.Gates().Probe = func(ctx context.Context, host string) error { return dnsFail(host) }
 	_ = u.Run()
 	if u.Gates().Down("example/a:latest") {
 		t.Fatal("an access-denied answer tripped the outage gate")
 	}
-	if n := u.totalFailed.Load(); n != 1 {
-		t.Fatalf("failed=%d, want the refusal reported as 1 failure", n)
+	if !u.Gates().Held("example/a:latest") {
+		t.Fatal("refused ref is not held")
+	}
+	calls, pulls := client.remoteCalls, client.pullCalls
+	for i := 0; i < 5; i++ {
+		_ = u.Run()
+	}
+	if client.remoteCalls != calls || client.pullCalls != pulls {
+		t.Fatalf("held ref still hit the registry: digest %d->%d pulls %d->%d", calls, client.remoteCalls, pulls, client.pullCalls)
+	}
+	if n := u.totalFailed.Load(); n != 0 {
+		t.Fatalf("failed=%d, a held refusal must not count as a failure", n)
+	}
+	clk.advance(registry.RefusedMinHold + time.Second)
+	_ = u.Run()
+	if client.remoteCalls != calls+1 {
+		t.Fatalf("after the wait the ref was not retried (digest calls %d, want %d)", client.remoteCalls, calls+1)
+	}
+	// second refusal doubles the wait
+	clk.advance(registry.RefusedMinHold + time.Second)
+	_ = u.Run()
+	if client.remoteCalls != calls+1 {
+		t.Fatal("wait did not double after the second refusal")
+	}
+}
+
+// A refusal of one ref must not hold another ref on the same host.
+func TestRefusalIsPerRef(t *testing.T) {
+	bad := stubContainer{id: "c1", name: "priv", ref: "ghcr.io/x/priv:latest"}
+	good := stubContainer{id: "c2", name: "pub", ref: "ghcr.io/x/pub:latest"}
+	client := newStub(bad, good)
+	client.errFor = map[string]error{bad.ref: fmt.Errorf("unauthorized: authentication required")}
+	u, _ := newClocked(client, &config.Config{})
+	_ = u.Run()
+	if !u.Gates().Held(bad.ref) || u.Gates().Held(good.ref) {
+		t.Fatal("refusal must hold only the refused ref")
+	}
+	if len(client.recreated) != 1 || client.recreated[0] != "c2" {
+		t.Fatalf("recreated %v, want the public image rolled", client.recreated)
+	}
+}
+
+// Docker Hub 429: the host is held (digest check and pull alike), registry
+// calls stop, the wait doubles per consecutive 429 up to 1h, another host is
+// unaffected, and the health watcher's network gate stays up.
+func TestRateLimitHoldsHostAndBacksOff(t *testing.T) {
+	a := runningContainer("c1", "a")
+	b := runningContainer("c2", "b")
+	other := stubContainer{id: "c3", name: "g", ref: "ghcr.io/x/g:latest"}
+	client := newStub(a, b, other)
+	client.errFor = map[string]error{a.ref: errors.New(hubLimit), b.ref: errors.New(hubLimit)}
+	u, clk := newClocked(client, &config.Config{})
+	g := u.Gates()
+	_ = u.Run()
+	if !g.Held(a.ref) || !g.Held(b.ref) || g.Held(other.ref) {
+		t.Fatal("429 must hold docker.io only")
+	}
+	if g.Down(a.ref) || g.AnyDown() {
+		t.Fatal("a 429 must not flag the network gate (health restarts stay allowed)")
+	}
+	if len(client.recreated) != 1 || client.recreated[0] != "c3" {
+		t.Fatalf("recreated %v, want only the ghcr container", client.recreated)
+	}
+	calls := client.remoteCalls
+	for i := 0; i < 5; i++ {
+		_ = u.Run()
+	}
+	if client.remoteCalls != calls+5 { // only the unheld ghcr container asks each pass
+		t.Fatalf("host on hold still got registry calls (%d -> %d, want +5 from ghcr only)", calls, client.remoteCalls)
+	}
+	want := registry.RateLimitMinHold
+	for i := 0; i < 6; i++ {
+		clk.advance(want - time.Second)
+		if !g.Held(a.ref) {
+			t.Fatalf("round %d: hold ended early (want %s)", i, want)
+		}
+		clk.advance(2 * time.Second)
+		if g.Held(a.ref) {
+			t.Fatalf("round %d: hold lasted past %s", i, want)
+		}
+		_ = u.Run() // retried, 429 again, hold doubles
+		want *= 2
+		if want > registry.RateLimitMaxHold {
+			want = registry.RateLimitMaxHold
+		}
+	}
+	if want != registry.RateLimitMaxHold {
+		t.Fatal("test did not reach the cap")
+	}
+}
+
+// A hold keeps answering with the local image, so an image pulled earlier still rolls.
+func TestHeldRefStillRollsPulledImage(t *testing.T) {
+	c := runningContainer("c1", "a")
+	client := newStub(c)
+	client.errFor = map[string]error{c.ref: errors.New(hubLimit)}
+	u, _ := newClocked(client, &config.Config{})
+	client.local[c.ref] = "sha256:pulled-earlier"
+	_ = u.Run()
+	if len(client.recreated) != 1 {
+		t.Fatalf("recreated %v, want the container rolled to the already pulled image", client.recreated)
+	}
+}
+
+// Failures from calls admitted before the hold took effect must not escalate it.
+func TestRateLimitDoesNotEscalateWithinHold(t *testing.T) {
+	g := registry.NewGates()
+	clk := &fakeClock{t: time.Unix(1e9, 0)}
+	g.SetClock(clk.now)
+	err := errors.New(hubLimit)
+	_, d1, first := g.Hold("a:1", err)
+	_, d2, again := g.Hold("b:1", err)
+	if !first || again || d1 != registry.RateLimitMinHold || d2 != d1 {
+		t.Fatalf("concurrent 429s escalated: %v/%v %v/%v", first, again, d1, d2)
+	}
+	g.Release("c:1")
+	if g.Held("a:1") {
+		t.Fatal("a success on the host must clear its 429 hold")
+	}
+}
+
+// A refused image that WAS pulled from a registry (has RepoDigests) is not treated as local-only.
+func TestRefusedPulledImageStillTriesPull(t *testing.T) {
+	client := newStub(runningContainer("c1", "a"))
+	client.remoteErr = fmt.Errorf("unauthorized: authentication required")
+	u, _ := newClocked(client, &config.Config{})
+	_ = u.Run()
+	if client.pullCalls != 1 {
+		t.Fatalf("pull calls=%d, want 1 (digest refusal falls through to a pull)", client.pullCalls)
+	}
+}
+
+// docker.io is checked at most every hub-interval; other hosts every pass.
+func TestHubIntervalThrottlesDockerIOOnly(t *testing.T) {
+	hub := runningContainer("c1", "a")
+	gh := stubContainer{id: "c2", name: "g", ref: "ghcr.io/x/g:latest", imageID: "sha256:new"}
+	client := newStub(hub, gh)
+	client.registry[gh.ref] = "sha256:new"
+	client.local[gh.ref] = "sha256:new"
+	client.local[hub.ref] = "sha256:new"
+	client.containers[0].imageID = "sha256:new"
+	u, clk := newClocked(client, &config.Config{HubInterval: time.Hour})
+	_ = u.Run()
+	first := client.remoteCalls
+	if first != 2 {
+		t.Fatalf("first pass digest calls=%d, want 2", first)
+	}
+	clk.advance(10 * time.Minute)
+	_ = u.Run()
+	if client.remoteCalls != first+1 {
+		t.Fatalf("second pass: %d new digest calls, want 1 (ghcr only)", client.remoteCalls-first)
+	}
+	clk.advance(time.Hour)
+	_ = u.Run()
+	if client.remoteCalls != first+1+2 {
+		t.Fatalf("after the interval docker.io was not re-checked (%d)", client.remoteCalls)
+	}
+	// manual update now bypasses the throttle
+	u.ResetBackoff()
+	n := client.remoteCalls
+	_ = u.Run()
+	if client.remoteCalls != n+2 {
+		t.Fatal("ResetBackoff did not clear the throttle")
+	}
+}
+
+// A 429 stamps nothing: the next pass after the hold asks again.
+func TestRateLimitDoesNotStampHubThrottle(t *testing.T) {
+	c := runningContainer("c1", "a")
+	client := newStub(c)
+	client.errFor = map[string]error{c.ref: errors.New(hubLimit)}
+	u, clk := newClocked(client, &config.Config{HubInterval: 3 * time.Hour})
+	_ = u.Run()
+	clk.advance(registry.RateLimitMinHold + time.Second)
+	n := client.remoteCalls
+	_ = u.Run()
+	if client.remoteCalls != n+1 {
+		t.Fatal("hold over but docker.io was not retried (throttle stamped on 429?)")
 	}
 }

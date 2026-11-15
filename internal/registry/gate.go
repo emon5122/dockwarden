@@ -19,6 +19,15 @@ const (
 	DefaultMinBackoff = 30 * time.Second
 	// DefaultMaxBackoff caps the exponential wait.
 	DefaultMaxBackoff = 10 * time.Minute
+
+	// Rate-limit (429) holds: the first wait, doubling per consecutive 429, capped.
+	// The Docker daemon API does not expose Retry-After / RateLimit-Reset, so the
+	// wait cannot follow the reset header; exponential with a 1 h cap is the bound.
+	RateLimitMinHold = 10 * time.Minute
+	RateLimitMaxHold = time.Hour
+	// Refusal (401/403/denied/not found) holds are per image ref.
+	RefusedMinHold = 15 * time.Minute
+	RefusedMaxHold = 6 * time.Hour
 )
 
 // HostOf returns the registry host of an image ref ("docker.io" when the ref
@@ -52,13 +61,19 @@ type Gates struct {
 	mu       sync.Mutex
 	min, max time.Duration
 	hosts    map[string]*hostState
+	// pull holds, kept apart from the network "down" state: a hold stops pulls
+	// only, never the health watcher's restarts (see Down / AnyDown).
+	rate    map[string]*hold // by registry host
+	refused map[string]*hold // by image ref
+	now     func() time.Time
 	// Probe checks one registry host; nil error = reachable. Tests replace it.
 	Probe func(ctx context.Context, host string) error
 }
 
 // NewGates returns Gates with everything up and the default HTTPS probe.
 func NewGates() *Gates {
-	return &Gates{min: DefaultMinBackoff, max: DefaultMaxBackoff, hosts: map[string]*hostState{}, Probe: httpProbe}
+	return &Gates{min: DefaultMinBackoff, max: DefaultMaxBackoff, hosts: map[string]*hostState{},
+		rate: map[string]*hold{}, refused: map[string]*hold{}, now: time.Now, Probe: httpProbe}
 }
 
 // SetBackoff overrides the backoff bounds (tests).
@@ -217,4 +232,163 @@ func IsNetworkError(err error) bool {
 		}
 	}
 	return false
+}
+
+// Kind classifies a registry error.
+type Kind int
+
+const (
+	KindNone      Kind = iota
+	KindNetwork        // DNS / connectivity (see IsNetworkError)
+	KindRateLimit      // HTTP 429 / toomanyrequests
+	KindRefused        // 401/403/denied/unknown repository or tag
+)
+
+var rateLimitMarkers = []string{"toomanyrequests", "too many requests", "rate limit", "status code 429"}
+
+var refusedMarkers = []string{
+	"pull access denied",
+	"unauthorized",
+	"denied:",
+	": denied", // ghcr.io: `error from registry: denied`, `Head "...": denied`
+	"requested access to the resource is denied",
+	"authentication required",
+	"no basic auth credentials",
+	"status code 401",
+	"status code 403",
+	"manifest unknown",
+	"repository does not exist",
+}
+
+// Classify says what kind of registry failure err is. Network errors keep the
+// meaning of IsNetworkError and are checked first.
+func Classify(err error) Kind {
+	if err == nil {
+		return KindNone
+	}
+	if IsNetworkError(err) {
+		return KindNetwork
+	}
+	msg := strings.ToLower(err.Error())
+	for _, m := range rateLimitMarkers {
+		if strings.Contains(msg, m) {
+			return KindRateLimit
+		}
+	}
+	for _, m := range refusedMarkers {
+		if strings.Contains(msg, m) {
+			return KindRefused
+		}
+	}
+	return KindNone
+}
+
+type hold struct {
+	until   time.Time
+	backoff time.Duration
+}
+
+// SetClock replaces the clock used for holds (tests).
+func (g *Gates) SetClock(now func() time.Time) {
+	g.mu.Lock()
+	g.now = now
+	g.mu.Unlock()
+}
+
+// Held reports whether pulls of ref are on hold: its host answered 429 or the
+// ref itself was refused, and the wait has not elapsed. Unlike Down it is
+// never consulted by the health watcher.
+func (g *Gates) Held(ref string) bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := g.now()
+	if h := g.rate[HostOf(ref)]; h != nil && now.Before(h.until) {
+		return true
+	}
+	h := g.refused[ref]
+	return h != nil && now.Before(h.until)
+}
+
+// HeldCount is the number of active holds (hosts rate limited + refs refused).
+func (g *Gates) HeldCount() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now, n := g.now(), 0
+	for _, h := range g.rate {
+		if now.Before(h.until) {
+			n++
+		}
+	}
+	for _, h := range g.refused {
+		if now.Before(h.until) {
+			n++
+		}
+	}
+	return n
+}
+
+func (g *Gates) extend(m map[string]*hold, key string, min, max time.Duration) (time.Duration, bool) {
+	now := g.now()
+	h := m[key]
+	switch {
+	case h == nil:
+		h = &hold{backoff: min}
+		m[key] = h
+	case now.Before(h.until):
+		// A failure from a call admitted before the hold took effect: no escalation.
+		return h.until.Sub(now), false
+	default:
+		h.backoff *= 2
+		if h.backoff > max {
+			h.backoff = max
+		}
+	}
+	h.until = now.Add(h.backoff)
+	return h.backoff, true
+}
+
+// Hold records a 429 (per host) or a refusal (per ref) for err, per Classify,
+// and returns the wait and whether this call started or escalated it (false =
+// already on hold, nothing changed). Other kinds change nothing.
+func (g *Gates) Hold(ref string, err error) (Kind, time.Duration, bool) {
+	k := Classify(err)
+	if g == nil || (k != KindRateLimit && k != KindRefused) {
+		return k, 0, false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if k == KindRateLimit {
+		d, first := g.extend(g.rate, HostOf(ref), RateLimitMinHold, RateLimitMaxHold)
+		return k, d, first
+	}
+	d, first := g.extend(g.refused, ref, RefusedMinHold, RefusedMaxHold)
+	return k, d, first
+}
+
+// Release records a successful registry call for ref: it clears the host's
+// rate-limit state and ref's own refusal, nothing else.
+func (g *Gates) Release(ref string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	delete(g.rate, HostOf(ref))
+	delete(g.refused, ref)
+	g.mu.Unlock()
+}
+
+// ResetHolds drops every hold (a manual "update now").
+func (g *Gates) ResetHolds() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.rate, g.refused = map[string]*hold{}, map[string]*hold{}
+	g.mu.Unlock()
 }

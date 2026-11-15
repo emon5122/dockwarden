@@ -150,3 +150,38 @@ func TestIsNetworkError(t *testing.T) {
 		t.Error("nil")
 	}
 }
+
+func TestClassify(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want Kind
+	}{
+		{"toomanyrequests: You have reached your unauthenticated pull rate limit", KindRateLimit},
+		{"Error response from daemon: 429 Too Many Requests", KindRateLimit},
+		{"received unexpected HTTP status code 429", KindRateLimit},
+		{"pull access denied for x, repository does not exist or may require 'docker login'", KindRefused},
+		{"Head \"https://ghcr.io/v2/x/manifests/latest\": unauthorized: authentication required", KindRefused},
+		{"Error response from daemon: error from registry: denied\ndenied", KindRefused},
+		{"Error response from daemon: Head \"https://ghcr.io/v2/x/y/manifests/1\": denied", KindRefused},
+		{"denied: requested access to the resource is denied", KindRefused},
+		{"manifest for x:1 not found: manifest unknown: manifest unknown", KindRefused},
+		{"dial tcp: lookup registry-1.docker.io: no such host", KindNetwork},
+		{"error getting credentials - err: exec: \"docker-credential-x\": executable file not found in $PATH", KindNone},
+		{"context deadline exceeded", KindNone},
+		{"Error response from daemon: 500 Internal Server Error", KindNone},
+	}
+	for _, c := range cases {
+		if got := Classify(errors.New(c.msg)); got != c.want {
+			t.Errorf("Classify(%q)=%d want %d", c.msg, got, c.want)
+		}
+	}
+}
+
+func TestHoldsDoNotAffectDown(t *testing.T) {
+	g := NewGates()
+	g.Hold("a:1", errors.New("toomanyrequests: x"))
+	g.Hold("b:1", errors.New("unauthorized"))
+	if g.Down("a:1") || g.AnyDown() || !g.Held("a:1") || !g.Held("b:1") || g.HeldCount() != 2 {
+		t.Fatal("holds and the network gate must be independent")
+	}
+}

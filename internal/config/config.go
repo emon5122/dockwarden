@@ -72,10 +72,14 @@ type Config struct {
 	PullConcurrency int
 	// SelfUpdateInterval is the minimum time between DockWarden's own update checks
 	SelfUpdateInterval time.Duration
-	LabelEnable        bool
-	LabelName          string
-	LabelSchedule      string
-	Scope              string
+	// HubInterval is the minimum time between registry checks of one
+	// docker.io image (anonymous Docker Hub pulls are rate limited per IP).
+	// 0 = check every pass.
+	HubInterval   time.Duration
+	LabelEnable   bool
+	LabelName     string
+	LabelSchedule string
+	Scope         string
 
 	// Container settings
 	IncludeStopped    bool
@@ -131,6 +135,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.Bool("compose-roll", true, "Roll compose-created containers via their compose project so compose file changes (labels, limits, env) apply")
 	flags.Int("pull-concurrency", 1, "Maximum number of image pulls running at the same time")
 	flags.Duration("self-update-interval", 5*time.Minute, "Minimum time between DockWarden self-update checks")
+	flags.Duration("hub-interval", time.Hour, "Minimum time between registry checks of one docker.io image (0 = every pass)")
 	flags.Bool("label-enable", false, "Only manage containers with enable label")
 	flags.String("label-name", "dockwarden.enable", "Label to check for container management")
 	flags.String("label-schedule", "dockwarden.schedule", "Container label holding a per-container update window (cron spec, optional CRON_TZ= prefix)")
@@ -203,6 +208,7 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		ComposeRoll:        viper.GetBool("compose-roll"),
 		PullConcurrency:    viper.GetInt("pull-concurrency"),
 		SelfUpdateInterval: durationValue("self-update-interval"),
+		HubInterval:        durationValue("hub-interval"),
 		LabelEnable:        viper.GetBool("label-enable"),
 		LabelName:          viper.GetString("label-name"),
 		LabelSchedule:      viper.GetString("label-schedule"),

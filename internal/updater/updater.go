@@ -42,6 +42,10 @@ type Updater struct {
 	gates *registry.Gates
 	// pullSem caps simultaneous image pulls (Config.PullConcurrency, default 1)
 	pullSem chan struct{}
+	// hubChecked is when each docker.io ref last got an answer from its registry
+	// (Config.HubInterval throttle); in memory, so a restart re-checks once.
+	hubChecked   map[string]time.Time
+	hubCheckedMu sync.Mutex
 	// lastSelfCheck rate-limits the self-update check (Config.SelfUpdateInterval)
 	lastSelfCheck time.Time
 	// compose is the helper setup for compose rolls in the current pass (nil = off)
@@ -69,7 +73,18 @@ func New(client docker.Client, cfg *config.Config) *Updater {
 		now:     time.Now,
 		gates:   registry.NewGates(),
 		pullSem: make(chan struct{}, n),
+
+		hubChecked: map[string]time.Time{},
 	}
+}
+
+// ResetBackoff forgets every pull hold and docker.io throttle stamp, so the
+// next Run (a manual "update now") really asks the registries.
+func (u *Updater) ResetBackoff() {
+	u.gates.ResetHolds()
+	u.hubCheckedMu.Lock()
+	u.hubChecked = map[string]time.Time{}
+	u.hubCheckedMu.Unlock()
 }
 
 // Gates returns the registry reachability gates, to share with the health watcher.
@@ -77,6 +92,41 @@ func (u *Updater) Gates() *registry.Gates { return u.gates }
 
 // errRegistryDown marks a pull skipped because the registry is unreachable.
 var errRegistryDown = errors.New("registry unreachable, pull skipped (backing off)")
+
+// errPullHeld marks a pull skipped while its host is rate limited or the ref
+// was refused, and no local image exists to fall back on. It wraps
+// errRegistryDown so callers treat it as "skipped, backing off", not a failure.
+var errPullHeld = fmt.Errorf("%w: pull on hold (rate limit or refusal)", errRegistryDown)
+
+// hubThrottled reports whether ref is a docker.io image checked less than
+// Config.HubInterval ago.
+func (u *Updater) hubThrottled(ref string) bool {
+	iv := u.config.HubInterval
+	if iv <= 0 || registry.HostOf(ref) != "docker.io" {
+		return false
+	}
+	u.hubCheckedMu.Lock()
+	defer u.hubCheckedMu.Unlock()
+	last, ok := u.hubChecked[ref]
+	return ok && u.now().Sub(last) < iv
+}
+
+func (u *Updater) stampHub(ref string) {
+	if u.config.HubInterval <= 0 || registry.HostOf(ref) != "docker.io" {
+		return
+	}
+	u.hubCheckedMu.Lock()
+	u.hubChecked[ref] = u.now()
+	u.hubCheckedMu.Unlock()
+}
+
+// localImage returns the id the local tag of ref points to, no registry call:
+// used while pulls are held or throttled so an already pulled image still rolls.
+// ok=false when the image is not present locally.
+func (u *Updater) localImage(ctx context.Context, ref string) (string, bool) {
+	id, err := u.client.GetImageID(ctx, ref)
+	return id, err == nil
+}
 
 // Run executes an update cycle with concurrent container processing
 func (u *Updater) Run() error {
@@ -617,13 +667,19 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 	if u.gates.Down(imageRef) {
 		return "", errRegistryDown
 	}
+	if id, skip, err := u.skipRegistry(ctx, imageRef); skip {
+		return id, err
+	}
 
 	u.pullSem <- struct{}{}
 	defer func() { <-u.pullSem }()
 
-	// Another pull may have tripped the gate while we waited for a slot.
+	// Another pull may have tripped or held the host while we waited for a slot.
 	if u.gates.Down(imageRef) {
 		return "", errRegistryDown
+	}
+	if id, skip, err := u.skipRegistry(ctx, imageRef); skip {
+		return id, err
 	}
 
 	dctx, cancel := context.WithTimeout(ctx, digestTimeout)
@@ -631,6 +687,8 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 	cancel()
 	if err == nil {
 		u.gates.OK(imageRef)
+		u.gates.Release(imageRef)
+		u.stampHub(imageRef)
 		if local, lerr := u.client.LocalDigests(ctx, imageRef); lerr == nil {
 			for _, d := range local {
 				if d == remote {
@@ -644,9 +702,15 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 	} else if u.gates.Trip(imageRef, err) {
 		return "", u.outage(imageRef, err)
 	} else {
-		// The registry answered but cannot tell us the digest (denied, private
-		// registry, old daemon): it is reachable; fall through to a normal pull.
-		u.gates.OK(imageRef)
+		u.gates.OK(imageRef) // the registry answered
+		switch registry.Classify(err) {
+		case registry.KindRateLimit:
+			return u.held(ctx, imageRef, err)
+		}
+		// A refusal here is not final (private registry with working credentials,
+		// old daemon): fall through to a normal pull; if that is refused the ref is
+		// held. NB: RepoDigests is not a safe "local-only" signal (the containerd image
+		// store fills it for locally built and re-tagged images too).
 		log.Debugf("Digest check for %s failed (%v); pulling", imageRef, err)
 	}
 
@@ -657,15 +721,70 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 		if u.gates.Trip(imageRef, err) {
 			return "", u.outage(imageRef, err)
 		}
-		u.gates.OK(imageRef) // refused, not unreachable
+		u.gates.OK(imageRef) // refused or limited, not unreachable
+		if k, d, first := u.gates.Hold(imageRef, err); k == registry.KindRateLimit || k == registry.KindRefused {
+			return u.heldLogged(ctx, imageRef, err, k, d, first)
+		}
 		return "", fmt.Errorf("failed to pull image: %w", err)
 	}
 	u.gates.OK(imageRef)
+	u.gates.Release(imageRef)
+	u.stampHub(imageRef)
 	id, err := u.client.GetImageID(ctx, imageRef)
 	if err != nil {
 		return "", fmt.Errorf("failed to get new image id: %w", err)
 	}
 	return id, nil
+}
+
+// skipRegistry decides, without any registry call, whether ref is held (429 on
+// its host, or refused) or docker.io throttled. It then answers with the local
+// image id so an image pulled earlier still rolls; skip=false = go ask the registry.
+func (u *Updater) skipRegistry(ctx context.Context, ref string) (id string, skip bool, err error) {
+	held := u.gates.Held(ref)
+	if !held && !u.hubThrottled(ref) {
+		return "", false, nil
+	}
+	if lid, ok := u.localImage(ctx, ref); ok {
+		log.Debugf("Registry check of %s skipped (held=%v)", ref, held)
+		return lid, true, nil
+	}
+	if held {
+		return "", true, errPullHeld
+	}
+	return "", false, nil // throttled but pruned locally: ask the registry
+}
+
+// held answers a hold the same way skipRegistry does; cause (may be nil) is
+// recorded first.
+func (u *Updater) held(ctx context.Context, ref string, cause error) (string, error) {
+	if cause != nil {
+		if k, d, first := u.gates.Hold(ref, cause); k != registry.KindNone {
+			return u.heldLogged(ctx, ref, cause, k, d, first)
+		}
+	}
+	if id, ok := u.localImage(ctx, ref); ok {
+		return id, nil
+	}
+	return "", errPullHeld
+}
+
+// heldLogged logs a new hold (a 429 each time its wait starts or grows; a
+// refusal only the first time ever, later ones at debug) and answers with the
+// local image so an image pulled earlier still rolls.
+func (u *Updater) heldLogged(ctx context.Context, ref string, cause error, k registry.Kind, d time.Duration, first bool) (string, error) {
+	switch {
+	case first && k == registry.KindRateLimit:
+		log.Warnf("Registry %s rate limited (%v): pausing its pulls for %s", registry.HostOf(ref), cause, d)
+	case first && d == registry.RefusedMinHold:
+		log.Warnf("Pull of %s refused by its registry (%v): not retrying for %s (missing credentials, or a local-only image?)", ref, cause, d)
+	case first:
+		log.Debugf("Pull of %s refused again (%v): next try in %s", ref, cause, d)
+	}
+	if id, ok := u.localImage(ctx, ref); ok {
+		return id, nil
+	}
+	return "", errPullHeld
 }
 
 func (u *Updater) outage(imageRef string, err error) error {
@@ -727,6 +846,7 @@ func (u *Updater) GetStats() map[string]interface{} {
 		"total_updated": u.totalUpdated.Load(),
 		"total_failed":  u.totalFailed.Load(),
 		"last_run":      lastRun,
+		"held_pulls":    u.gates.HeldCount(),
 	}
 }
 

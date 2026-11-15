@@ -319,6 +319,7 @@ func (s *Server) handleTriggerUpdate(c *gin.Context) {
 		return
 	}
 
+	s.updater.ResetBackoff()
 	go func() {
 		if err := s.updater.Run(); err != nil {
 			log.Errorf("Manual update failed: %v", err)
@@ -530,6 +531,7 @@ func (s *Server) handleUITriggerUpdate(c *gin.Context) {
 		return
 	}
 
+	s.updater.ResetBackoff()
 	go func() {
 		if err := s.updater.Run(); err != nil {
 			log.Errorf("Manual update failed: %v", err)
