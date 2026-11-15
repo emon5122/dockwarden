@@ -1046,7 +1046,7 @@ func TestScopeFiltering(t *testing.T) {
 
 	names := func(cfg *config.Config) []string {
 		u := New(newStub(voice, plain, other), cfg)
-		list, err := u.client.ListContainers(context.Background())
+		list, err := u.client.ListContainers(context.Background(), docker.ListOptions{})
 		if err != nil {
 			t.Fatal(err)
 		}
