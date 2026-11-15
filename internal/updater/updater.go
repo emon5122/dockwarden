@@ -488,13 +488,11 @@ containerLoop:
 
 		// Check scope: a scoped instance handles only its own scope; an unscoped
 		// one leaves scope-labelled containers to the instance that owns them.
-		if sc := ctr.GetScope(); u.config.Scope != "" {
-			if sc != u.config.Scope {
-				continue
-			}
-		} else if sc != "" {
-			if _, seen := u.scopeSkipLogged.LoadOrStore(ctr.ID, true); !seen {
-				log.Debugf("Container %s skipped: scope %q belongs to a scoped instance", ctr.Name, sc)
+		if !ctr.InScope(u.config.Scope) {
+			if u.config.Scope == "" {
+				if _, seen := u.scopeSkipLogged.LoadOrStore(ctr.ID, true); !seen {
+					log.Debugf("Container %s skipped: scope %q belongs to a scoped instance", ctr.Name, ctr.GetScope())
+				}
 			}
 			continue
 		}
@@ -960,15 +958,17 @@ func (u *Updater) cleanupStaleContainers(ctx context.Context, originalName strin
 // digest semaphore. done=true means the answer (id, err) is final; done=false
 // means a pull is needed.
 func (u *Updater) checkDigest(ctx context.Context, imageRef string) (id string, done bool, err error) {
-	u.digestSem <- struct{}{}
-	defer func() { <-u.digestSem }()
-
+	// Gate checks first, outside the semaphore: a down registry must not wait
+	// behind slow digest calls.
 	if u.gates.Down(imageRef) {
 		return "", true, errRegistryDown
 	}
 	if id, skip, err := u.skipRegistry(ctx, imageRef); skip {
 		return id, true, err
 	}
+
+	u.digestSem <- struct{}{}
+	defer func() { <-u.digestSem }()
 
 	dctx, cancel := context.WithTimeout(ctx, digestTimeout)
 	remote, err := u.client.RemoteDigest(dctx, imageRef)

@@ -205,7 +205,7 @@ func (w *Watcher) checkHealthConcurrently() {
 		}
 
 		// Check scope filter
-		if w.config.Scope != "" && ctr.GetScope() != w.config.Scope {
+		if !ctr.InScope(w.config.Scope) {
 			continue
 		}
 
