@@ -687,12 +687,12 @@ func (u *Updater) fetchImage(ctx context.Context, imageRef string) (string, erro
 	cancel()
 	if err == nil {
 		u.gates.OK(imageRef)
-		u.gates.Release(imageRef)
-		u.stampHub(imageRef)
+		u.gates.ReleaseRef(imageRef)
 		if local, lerr := u.client.LocalDigests(ctx, imageRef); lerr == nil {
 			for _, d := range local {
 				if d == remote {
 					if id, ierr := u.client.GetImageID(ctx, imageRef); ierr == nil {
+						u.stampHub(imageRef)
 						log.Debugf("Image %s unchanged (digest %s), pull skipped", imageRef, truncateID(strings.TrimPrefix(remote, "sha256:")))
 						return id, nil
 					}

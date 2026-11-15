@@ -258,6 +258,8 @@ var refusedMarkers = []string{
 	"status code 403",
 	"manifest unknown",
 	"repository does not exist",
+	"forbidden",
+	"insufficient_scope",
 }
 
 // Classify says what kind of registry failure err is. Network errors keep the
@@ -279,6 +281,10 @@ func Classify(err error) Kind {
 		if strings.Contains(msg, m) {
 			return KindRefused
 		}
+	}
+	// containerd image store: "failed to resolve reference "x": ...: not found"
+	if strings.Contains(msg, "failed to resolve reference") && strings.Contains(msg, "not found") {
+		return KindRefused
 	}
 	return KindNone
 }
@@ -371,8 +377,20 @@ func (g *Gates) Hold(ref string, err error) (Kind, time.Duration, bool) {
 	return k, d, first
 }
 
-// Release records a successful registry call for ref: it clears the host's
-// rate-limit state and ref's own refusal, nothing else.
+// ReleaseRef records that a cheap manifest check of ref succeeded: it clears
+// ref's own refusal only. A host's 429 hold is kept: manifest HEADs are not
+// rate limited, so a good digest check says nothing about the pull limit.
+func (g *Gates) ReleaseRef(ref string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	delete(g.refused, ref)
+	g.mu.Unlock()
+}
+
+// Release records a successful pull of ref: it clears the host's rate-limit
+// state and ref's own refusal.
 func (g *Gates) Release(ref string) {
 	if g == nil {
 		return

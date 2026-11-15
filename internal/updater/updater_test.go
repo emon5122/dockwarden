@@ -36,8 +36,9 @@ type stubClient struct {
 	errFor      map[string]error // per-ref override of remoteErr
 	remoteCalls int
 	pullCalls   int
-	inflight    int // pulls running now
-	maxInflight int // peak simultaneous pulls
+	pullErr     map[string]error // per-ref error for PullImage only (RemoteDigest succeeds)
+	inflight    int              // pulls running now
+	maxInflight int              // peak simultaneous pulls
 	pullDelay   time.Duration
 }
 
@@ -126,6 +127,9 @@ func (s *stubClient) PullImage(ctx context.Context, imageName string) error {
 	}
 	s.mu.Lock()
 	defer func() { s.inflight--; s.mu.Unlock() }()
+	if err, ok := s.pullErr[imageName]; ok {
+		return err
+	}
 	if err := s.errOf(imageName); err != nil {
 		return err
 	}
@@ -859,14 +863,97 @@ func TestRateLimitDoesNotEscalateWithinHold(t *testing.T) {
 	}
 }
 
-// A refused image that WAS pulled from a registry (has RepoDigests) is not treated as local-only.
-func TestRefusedPulledImageStillTriesPull(t *testing.T) {
+// A digest refusal alone is not final (private registry with working creds):
+// the pull is still tried; its refusal then holds the ref.
+func TestDigestRefusalStillTriesPullThenHolds(t *testing.T) {
 	client := newStub(runningContainer("c1", "a"))
 	client.remoteErr = fmt.Errorf("unauthorized: authentication required")
 	u, _ := newClocked(client, &config.Config{})
 	_ = u.Run()
+	if client.pullCalls != 1 || !u.Gates().Held("example/a:latest") {
+		t.Fatalf("pull calls=%d held=%v, want 1 pull then held", client.pullCalls, u.Gates().Held("example/a:latest"))
+	}
+	_ = u.Run()
 	if client.pullCalls != 1 {
-		t.Fatalf("pull calls=%d, want 1 (digest refusal falls through to a pull)", client.pullCalls)
+		t.Fatal("held ref was pulled again")
+	}
+}
+
+// The realistic Docker Hub shape: manifest checks succeed (not rate limited),
+// the pull gets 429. A good digest check must not reset the escalation:
+// 10m, 20m, 40m, then 1h.
+func TestDigestOKPull429EscalatesHold(t *testing.T) {
+	c := runningContainer("c1", "a")
+	client := newStub(c)
+	client.pullErr = map[string]error{c.ref: errors.New(hubLimit)}
+	u, clk := newClocked(client, &config.Config{})
+	g := u.Gates()
+	_ = u.Run()
+	pulls := client.pullCalls
+	for _, want := range []time.Duration{registry.RateLimitMinHold, 2 * registry.RateLimitMinHold, 4 * registry.RateLimitMinHold, registry.RateLimitMaxHold, registry.RateLimitMaxHold} {
+		clk.advance(want - time.Second)
+		if !g.Held(c.ref) {
+			t.Fatalf("hold ended before %s", want)
+		}
+		clk.advance(2 * time.Second)
+		if g.Held(c.ref) {
+			t.Fatalf("hold lasted past %s", want)
+		}
+		_ = u.Run() // digest OK (changed), pull 429 again
+		pulls++
+		if client.pullCalls != pulls {
+			t.Fatalf("pull calls=%d want %d", client.pullCalls, pulls)
+		}
+		if u.totalFailed.Load() != 0 {
+			t.Fatal("429 counted as a failure")
+		}
+	}
+}
+
+// A changed digest followed by a failed pull must not stamp the hub throttle:
+// the next pass retries instead of waiting out hub-interval.
+func TestFailedPullDoesNotStampHubThrottle(t *testing.T) {
+	c := runningContainer("c1", "a")
+	client := newStub(c)
+	client.pullErr = map[string]error{c.ref: errors.New("Error response from daemon: 500 Internal Server Error")}
+	u, _ := newClocked(client, &config.Config{HubInterval: time.Hour})
+	_ = u.Run()
+	_ = u.Run()
+	if client.pullCalls != 2 {
+		t.Fatalf("pull calls=%d, want a retry on the next pass (throttle stamped despite the failed pull?)", client.pullCalls)
+	}
+}
+
+// ResetBackoff (API "update now") clears real holds.
+func TestResetBackoffClearsHolds(t *testing.T) {
+	c := runningContainer("c1", "a")
+	client := newStub(c)
+	client.remoteErr = errors.New(hubLimit)
+	u, _ := newClocked(client, &config.Config{})
+	_ = u.Run()
+	if !u.Gates().Held(c.ref) {
+		t.Fatal("not held")
+	}
+	u.ResetBackoff()
+	if u.Gates().Held(c.ref) || u.Gates().HeldCount() != 0 {
+		t.Fatal("ResetBackoff left a hold")
+	}
+}
+
+// Held and no local image to fall back on: skipped quietly (wraps errRegistryDown), not a failure.
+func TestHeldWithoutLocalImageIsSkippedNotFailed(t *testing.T) {
+	c := runningContainer("c1", "a")
+	client := newStub(c)
+	client.errFor = map[string]error{c.ref: errors.New(hubLimit)}
+	u, _ := newClocked(client, &config.Config{})
+	_ = u.Run()
+	delete(client.local, c.ref) // pruned meanwhile
+	_, err := u.fetchImage(context.Background(), c.ref)
+	if !errors.Is(err, errPullHeld) || !errors.Is(err, errRegistryDown) {
+		t.Fatalf("err=%v, want errPullHeld", err)
+	}
+	if u.totalFailed.Load() != 0 {
+		t.Fatal("counted as failed")
 	}
 }
 
