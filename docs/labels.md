@@ -56,6 +56,31 @@ container with the label `dockwarden.compose=false`. Helper containers carry the
 `dockwarden.helper` label and are removed after each run. End-to-end check on a
 real daemon: `test/e2e/compose-roll.sh`.
 
+### Long drains (detached rolls)
+
+A container whose stop timeout (the longest of `dockwarden.stop-timeout`, the
+compose file's label and `stop_grace_period`) is longer than
+`DOCKWARDEN_DETACH_STOP_TIMEOUT` (default 10m) is not stopped inside the update
+cycle. DockWarden starts a helper from its own image (`dockwarden roll`, named
+`dockwarden-compose-up-<project>-<service>-<ts>` for compose services,
+`dockwarden-roll-<name>-<ts>` otherwise) that does the drain (stop with the
+signal and timeout), then the compose `up` or the legacy recreate with the same
+fallbacks, then the old-image cleanup. The cycle goes on with the other
+containers at once.
+
+- One roll per container: while its helper runs, every pass skips the container
+  (every replica of a compose service) before any registry call and logs
+  `roll is still running in helper ...`.
+- The next pass after the helper exits logs the result (`Updated container X
+  (detached roll ...)` or the error with the helper's last lines) and removes it.
+- Helpers carry `dockwarden.roll.target` and outlive DockWarden, so a self-update
+  during a drain does not lose the roll.
+- The compose `up` runs after the drain, from the compose files as they are then.
+- Without a helper image (DockWarden not in a container, or no docker.sock bind)
+  the roll stays inside the cycle, as before, with a warning.
+
+End-to-end check on a real daemon: `test/e2e/long-drain.sh`.
+
 ## Update Labels
 
 | Label | Values | Default | Description |

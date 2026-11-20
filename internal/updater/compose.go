@@ -76,7 +76,8 @@ func (u *Updater) prepareCompose(ctx context.Context, self *docker.Container, se
 	u.composeRollsMu.Lock()
 	u.composeRolls = map[string]*composeOnce{}
 	u.composeRollsMu.Unlock()
-	if !u.config.ComposeRoll {
+	// the helper setup also serves detached rolls (detach.go)
+	if !u.config.ComposeRoll && u.config.DetachStopTimeout <= 0 {
 		return
 	}
 	if self == nil && selfHint != "" {
@@ -116,14 +117,15 @@ func (u *Updater) prepareCompose(ctx context.Context, self *docker.Container, se
 
 // removeStaleHelpers removes finished helpers a previous DockWarden left behind
 // (it died before removing them). Running ones are left alone: an orphaned
-// `up` finishes on its own and is removed on a later pass.
+// `up` finishes on its own and is removed on a later pass. Roll helpers are
+// collectRolls' (their exit code is reported first).
 func (u *Updater) removeStaleHelpers(ctx context.Context) {
 	helpers, err := u.client.ListContainers(ctx, docker.ListOptions{All: true, LabelFilter: docker.HelperLabel})
 	if err != nil {
 		return
 	}
 	for _, h := range helpers {
-		if h.GetLabel(docker.HelperLabel) == "" || h.IsRunning() {
+		if h.GetLabel(docker.HelperLabel) == "" || h.IsRunning() || h.GetLabel(RollTargetLabel) != "" {
 			continue
 		}
 		if err := u.client.RemoveContainer(ctx, h.ID); err != nil {
@@ -135,7 +137,7 @@ func (u *Updater) removeStaleHelpers(ctx context.Context) {
 // composeRoll rolls ctr through its compose project. rolled=false with a nil
 // error means "not a compose container": the caller does the legacy recreate.
 func (u *Updater) composeRoll(ctx context.Context, ctr docker.Container, timeout time.Duration) (bool, error) {
-	if u.compose == nil {
+	if u.compose == nil || !u.config.ComposeRoll {
 		return false, nil
 	}
 	project, ok := docker.ComposeProjectOf(ctr.Labels)
@@ -160,6 +162,10 @@ func (u *Updater) composeRoll(ctx context.Context, ctr docker.Container, timeout
 	switch {
 	case first:
 		return once.rolled, once.err
+	case errors.Is(once.err, errRollDetached):
+		// the helper's `up` recreates every replica of the service
+		log.Infof("Container %s: compose service %s is rolling in a detached helper", ctr.Name, key)
+		return true, errRollDetached
 	case once.rolled:
 		// `up` recreated every replica of the service already
 		log.Infof("Container %s: already rolled with compose service %s", ctr.Name, key)
@@ -225,13 +231,25 @@ func (u *Updater) composeRollOnce(ctx context.Context, ctr docker.Container, p d
 		log.Infof("Container %s: compose roll changes labels %s", ctr.Name, strings.Join(keys, ","))
 	}
 
+	// a long drain goes to a helper; its up runs after the drain, from the
+	// compose files as they are then
+	if err := u.detachRoll(ctx, ctr, rollRequest{mode: RollModeCompose, project: p, timeout: stopTimeout,
+		signal: signal, cleanupImage: u.cleanupImageOf(ctr)}); err != nil {
+		return errors.Is(err, errRollDetached), err
+	}
+
 	log.Infof("Container %s: rolling through compose project %s (service %s, stop timeout %s)", ctr.Name, p.Project, p.Service, stopTimeout)
 	if err := u.client.StopContainer(ctx, ctr.ID, stopTimeout, signal); err != nil {
 		return false, fmt.Errorf("stop before compose roll: %w", err)
 	}
+	return u.composeUp(ctx, ctr, p, stopTimeout)
+}
 
+// composeUp runs `up` for a stopped container's service; on failure it gets
+// the old container back (a fallback error) or starts what is left.
+func (u *Updater) composeUp(ctx context.Context, ctr docker.Container, p docker.ComposeProject, stopTimeout time.Duration) (bool, error) {
 	secs := strconv.Itoa(int(stopTimeout.Seconds()))
-	res, err = u.runCompose(ctx, p, "up", stopTimeout+composeUpExtra,
+	_, err := u.runCompose(ctx, p, "up", stopTimeout+composeUpExtra,
 		"up", "--detach", "--no-deps", "--force-recreate", "--pull", "never", "--no-build", "--timeout", secs, p.Service)
 	if err == nil {
 		return true, nil
@@ -292,9 +310,13 @@ func (u *Updater) startComposeService(ctx context.Context, p docker.ComposeProje
 	}
 }
 
-// runCompose runs docker-compose in a helper; a non-zero exit is an error
-// carrying compose's stderr (never stdout: a rendered config holds env values).
+// runCompose runs docker-compose (in a helper, or in this process inside a
+// roll helper); a non-zero exit is an error carrying compose's stderr (never
+// stdout: a rendered config holds env values).
 func (u *Updater) runCompose(ctx context.Context, p docker.ComposeProject, step string, timeout time.Duration, args ...string) (docker.HelperResult, error) {
+	if u.composeExec != nil {
+		return u.composeExec(ctx, p, step, timeout, args...)
+	}
 	binds := append([]string{u.compose.socketBind}, p.Binds()...)
 	spec := docker.HelperSpec{
 		Name:       fmt.Sprintf("dockwarden-compose-%s-%s-%s-%d", step, p.Project, p.Service, u.now().UnixNano()),

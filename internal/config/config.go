@@ -68,6 +68,9 @@ type Config struct {
 	// ComposeRoll rolls compose-created containers through their compose
 	// project (docker-compose up in a helper) so compose file changes apply.
 	ComposeRoll bool
+	// DetachStopTimeout: a roll whose stop timeout is longer runs in a
+	// detached helper so the drain does not hold the cycle (0 = never)
+	DetachStopTimeout time.Duration
 	// PullConcurrency caps simultaneous image pulls (default 1: small boxes hang otherwise)
 	PullConcurrency int
 	// DigestConcurrency caps simultaneous manifest-digest checks (default 6)
@@ -134,6 +137,7 @@ func RegisterFlags(cmd *cobra.Command) {
 	flags.Bool("monitor-only", false, "Monitor mode, no changes made")
 	flags.Bool("rolling-restart", false, "Restart containers one at a time")
 	flags.Duration("stop-timeout", 10*time.Second, "Container stop timeout")
+	flags.Duration("detach-stop-timeout", 10*time.Minute, "Roll a container whose stop timeout is longer than this in a detached helper, so its drain does not hold the update cycle (0 = never)")
 	flags.Bool("compose-roll", true, "Roll compose-created containers via their compose project so compose file changes (labels, limits, env) apply")
 	flags.Int("pull-concurrency", 1, "Maximum number of image pulls running at the same time")
 	flags.Int("digest-concurrency", 6, "Maximum number of registry digest checks running at the same time")
@@ -209,6 +213,7 @@ func Load(cmd *cobra.Command) (*Config, error) {
 		RollingRestart:     viper.GetBool("rolling-restart"),
 		StopTimeout:        durationValue("stop-timeout"),
 		ComposeRoll:        viper.GetBool("compose-roll"),
+		DetachStopTimeout:  durationValue("detach-stop-timeout"),
 		PullConcurrency:    viper.GetInt("pull-concurrency"),
 		DigestConcurrency:  viper.GetInt("digest-concurrency"),
 		SelfUpdateInterval: durationValue("self-update-interval"),

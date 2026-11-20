@@ -49,6 +49,7 @@ type stubContainer struct {
 	imageID  string // .Image
 	labels   map[string]string
 	state    string // "" = running
+	exitCode int    // inspect State.ExitCode
 }
 
 func (c stubContainer) stateOr() string {
@@ -81,7 +82,7 @@ func (s *stubClient) GetContainer(ctx context.Context, id string) (docker.Contai
 	defer s.mu.Unlock()
 	for _, c := range s.containers {
 		if c.id == id {
-			return docker.Container{ID: c.id, Name: c.name, Image: c.ref, ImageID: c.imageID, State: c.stateOr(), Labels: c.labels}, nil
+			return docker.Container{ID: c.id, Name: c.name, Image: c.ref, ImageID: c.imageID, State: c.stateOr(), Labels: c.labels, ExitCode: c.exitCode}, nil
 		}
 	}
 	return docker.Container{}, fmt.Errorf("no such container %s", id)
