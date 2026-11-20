@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.1.0](https://github.com/emon5122/dockwarden/compare/v3.0.0...v3.1.0) (2026-11-20)
+
+
+### Features
+
+* **updater:** roll long-drain containers in a detached helper ([#69](https://github.com/emon5122/dockwarden/issues/69)) ([0f170d5](https://github.com/emon5122/dockwarden/commit/0f170d5d75e82ff84752c604ef1d6f7a5b2a2e0d))
+
 ## [3.0.0](https://github.com/emon5122/dockwarden/compare/v2.1.1...v3.0.0) (2026-11-15)
 
 
