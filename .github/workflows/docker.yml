@@ -70,6 +70,9 @@ jobs:
       - name: Pull holds on a real daemon (local-only, refused, private refs)
         run: test/e2e/pull-holds.sh
 
+      - name: Long drains roll in detached helpers on a real daemon
+        run: test/e2e/long-drain.sh
+
   build:
     if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--')
     name: Build

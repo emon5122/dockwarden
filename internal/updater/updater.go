@@ -24,7 +24,9 @@ type UpdateResult struct {
 	OldImageID    string
 	NewImageID    string
 	Updated       bool
-	Error         error
+	// Detached: the roll was handed to a helper and finishes after this pass
+	Detached bool
+	Error    error
 }
 
 // Updater handles container image updates using Go's native concurrency
@@ -57,6 +59,14 @@ type Updater struct {
 	// composeRolls dedupes replicas of one compose service within a pass
 	composeRolls   map[string]*composeOnce
 	composeRollsMu sync.Mutex
+	// composeExec replaces the compose helper container (set inside a roll
+	// helper, which runs docker-compose itself)
+	composeExec func(ctx context.Context, p docker.ComposeProject, step string, timeout time.Duration, args ...string) (docker.HelperResult, error)
+	// rollsInFlight maps a roll key to the detached roll helper running it
+	// (refreshed every pass); rollsUnknown: the helpers could not be listed
+	rollsInFlight map[string]string
+	rollsUnknown  bool
+	rollsMu       sync.Mutex
 
 	// Statistics
 	totalUpdated atomic.Int64
@@ -150,6 +160,10 @@ func (u *Updater) Run() error {
 
 	log.Info("Starting update check...")
 
+	// Roll helpers first: a helper that finishes after the container list
+	// below would otherwise leave this pass a stale container ID to roll.
+	u.collectRolls(ctx)
+
 	// List containers
 	containers, err := u.client.ListContainers(ctx, docker.ListOptions{
 		All:           u.config.IncludeStopped,
@@ -181,9 +195,11 @@ func (u *Updater) Run() error {
 	results := u.processContainersConcurrently(ctx, filtered, newPullCache(u))
 
 	// Summarize results
-	var updated, failed int
+	var updated, failed, detached int
 	for _, result := range results {
-		if errors.Is(result.Error, errRegistryDown) {
+		if result.Detached {
+			detached++
+		} else if errors.Is(result.Error, errRegistryDown) {
 			log.Debugf("%s: %v", result.ContainerName, result.Error)
 		} else if result.Error != nil {
 			log.Errorf("Failed to process %s: %v", result.ContainerName, result.Error)
@@ -200,7 +216,11 @@ func (u *Updater) Run() error {
 	u.recordRun(startTime)
 
 	duration := time.Since(startTime)
-	log.Infof("Update check complete: %d updated, %d failed, took %s", updated, failed, duration.Round(time.Millisecond))
+	if detached > 0 {
+		log.Infof("Update check complete: %d updated, %d failed, %d rolling in detached helpers, took %s", updated, failed, detached, duration.Round(time.Millisecond))
+	} else {
+		log.Infof("Update check complete: %d updated, %d failed, took %s", updated, failed, duration.Round(time.Millisecond))
+	}
 
 	// Clean up any stale containers left by previous failed self-updates
 	// (dockwarden-old, dockwarden-old-old, ...) before doing anything else.
@@ -425,6 +445,12 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container, pu
 		OldImageID:    ctr.ImageID,
 	}
 
+	// one roll per container: a detached roll still draining owns it
+	if helper, ok := u.rollInFlight(ctr); ok {
+		log.Infof("Container %s: skipped, its roll is still running in helper %s", ctr.Name, helper)
+		return result
+	}
+
 	needsUpdate, err := u.checkForUpdate(ctx, ctr, pulls)
 	if err != nil {
 		result.Error = fmt.Errorf("failed to check for updates: %w", err)
@@ -446,7 +472,10 @@ func (u *Updater) processContainer(ctx context.Context, ctr docker.Container, pu
 		return result
 	}
 
-	if err := u.updateContainer(ctx, ctr); err != nil {
+	if err := u.updateContainer(ctx, ctr); errors.Is(err, errRollDetached) {
+		result.Detached = true
+		return result
+	} else if err != nil {
 		result.Error = fmt.Errorf("failed to update: %w", err)
 		return result
 	}
@@ -795,17 +824,20 @@ func (u *Updater) updateContainer(ctx context.Context, ctr docker.Container) err
 	rolled, err := u.composeRoll(ctx, ctr, timeout)
 	var fb *composeFallback
 	switch {
+	case errors.Is(err, errRollDetached):
+		// a helper drains and rolls it (and cleans up the old image)
+		return err
 	case err == nil && rolled:
 		// done through the compose project
 	case err == nil:
 		// not a compose container (or compose rolls are off): legacy recreate
-		if _, err := u.client.RecreateContainer(ctx, ctr.ID, timeout, startStopped); err != nil {
-			return fmt.Errorf("failed to recreate container: %w", err)
+		if err := u.recreate(ctx, ctr, timeout, startStopped); err != nil {
+			return err
 		}
 	case errors.As(err, &fb):
 		log.Warnf("Container %s: compose roll not possible (%v); recreating from the old container config", ctr.Name, fb.err)
-		if _, err := u.client.RecreateContainer(ctx, ctr.ID, timeout, startStopped || fb.stoppedByUs); err != nil {
-			return fmt.Errorf("failed to recreate container: %w", err)
+		if err := u.recreate(ctx, ctr, timeout, startStopped || fb.stoppedByUs); err != nil {
+			return err
 		}
 	default:
 		return err
